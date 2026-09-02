@@ -1,0 +1,82 @@
+# VoxGuard — Python dependencies (Python 3.10+)
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  PyTorch — CPU build                                                    │
+# │                                                                         │
+# │  Install the standard CPU-only build with:                              │
+# │                                                                         │
+# │      pip install torch torchaudio                                       │
+# │                                                                         │
+# │  Do NOT add a --index-url pointing to a CUDA wheel.  This project has  │
+# │  no local CUDA GPU to target; there is no benefit to pulling a multi-   │
+# │  GB CUDA build onto a CPU-only workstation.                             │
+# │                                                                         │
+# │  GPU-accelerated training and inference run on Kaggle notebooks, which  │
+# │  come with torch + CUDA pre-installed (see Phase 0 Kaggle workflow).    │
+# │  The requirements below therefore carry no torch index-url override.    │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+# ── PyTorch ecosystem ──────────────────────────────────────────────────────
+torch>=2.3,<3
+torchaudio>=2.3,<3
+
+# ── Hugging Face stack ─────────────────────────────────────────────────────
+transformers>=4.41,<5          # wav2vec2 / HuBERT / WavLM embedding backbones
+huggingface_hub>=0.23,<1       # model-card downloads, push_to_hub helpers
+datasets>=2.20,<3              # dataset loading + streaming for training splits
+accelerate>=0.31,<1            # mixed-precision / multi-device training shim
+
+# ── Speaker diarisation / verification ────────────────────────────────────
+speechbrain>=1.0,<2            # speaker embedding models (e.g. ECAPA-TDNN)
+pyannote.audio>=3.1,<4         # speaker diarisation pipeline (Phase 5)
+
+# ── Audio feature extraction ───────────────────────────────────────────────
+librosa>=0.10,<1               # prosody, spectral, MFCCs, pitch
+soundfile>=0.12,<1             # fast audio file I/O (backend for librosa & torchaudio)
+
+# ── ASR / voice activity ──────────────────────────────────────────────────
+faster-whisper>=1.0,<2         # CTranslate2-based Whisper for transcript context
+
+# ── Synthetic voice generation (test data / red-teaming, Phase 0) ─────────
+# TTS (Coqui XTTS-v2) is intentionally NOT listed here.
+# It pins pandas<2.0, which conflicts with datasets>=2.20 (needs pandas>=2.x).
+# Install it in an isolated environment when you need to generate synthetic
+# samples for red-teaming:
+#
+#   pip install -r requirements-tts.txt
+#
+# See requirements-tts.txt for details.
+
+# ── Data science utilities ────────────────────────────────────────────────
+numpy>=1.26,<2
+pandas>=2.2,<3
+scikit-learn>=1.5,<2           # classifier heads, metrics, cross-validation
+matplotlib>=3.9,<4             # training-curve plots, feature visualisation
+
+# ── Explainability (Phase 9) ──────────────────────────────────────────────
+shap>=0.45,<1                  # SHAP values for acoustic feature attribution
+
+# ── Gradio UI ─────────────────────────────────────────────────────────────
+gradio>=4.37,<5                # interactive web UI for demo and evaluation
+
+# ── FastAPI REST server (Phase 11) ────────────────────────────────────────
+fastapi>=0.111,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1     # required by FastAPI for multipart/form-data file uploads
+
+# ── Configuration / environment ───────────────────────────────────────────
+python-dotenv>=1.0,<2          # load .env into os.environ at process start
+
+# ── Kaggle data pipeline ──────────────────────────────────────────────────
+kaggle>=1.6,<2                 # Kaggle CLI + Python API for dataset downloads
+
+# ── Privacy / structured logging ──────────────────────────────────────────
+python-json-logger>=2.0,<3     # JSON-structured log output for session logging
+
+# ── Testing ───────────────────────────────────────────────────────────────
+pytest>=8.2,<9
+pytest-cov>=5.0,<6
+httpx>=0.27,<1                 # async HTTP client; required by FastAPI TestClient
+
+# ── Dev tooling ───────────────────────────────────────────────────────────
+ruff>=0.4,<1                   # linter + formatter (replaces flake8 + black)

@@ -1,0 +1,39 @@
+# requirements-tts.txt — isolated environment for Coqui TTS / XTTS-v2
+#
+# WHY THIS FILE EXISTS
+# ────────────────────
+# Coqui TTS 0.22.x pins pandas<2.0, which conflicts with the main project's
+# dependency on datasets>=2.20 (which requires pandas>=2.x).  The two cannot
+# coexist in a single pip environment.
+#
+# TTS is only needed for Phase 0 red-teaming (generating synthetic voice
+# samples locally to test the detector against).  It is never imported by
+# any core VoxGuard module.  The solution is a separate virtual environment
+# used only when you need to produce synthetic samples.
+#
+# SETUP
+# ─────
+#   python -m venv .venv-tts
+#   # Windows
+#   .venv-tts\Scripts\activate
+#   # macOS / Linux
+#   source .venv-tts/bin/activate
+#
+#   pip install --upgrade pip
+#   pip install -r requirements-tts.txt
+#
+# USAGE
+# ─────
+# Activate .venv-tts, run your synthesis script, save the output WAV files
+# to data/raw/, then deactivate and switch back to the main .venv for all
+# detection/training work.
+#
+# NOTE: On Kaggle notebooks TTS is installed in a separate cell at the top
+# of the Phase 0 notebook; it does not affect the detection pipeline there
+# either.
+
+TTS>=0.22,<1                   # Coqui XTTS-v2 voice synthesis
+torch>=2.3,<3                  # TTS needs torch; pin consistent with main env
+torchaudio>=2.3,<3
+soundfile>=0.12,<1             # audio I/O for saving synthesised clips
+numpy>=1.26,<2

@@ -1,0 +1,56 @@
+# ── Data (keep directory structure via .gitkeep) ────────────────────────────
+data/raw/
+data/processed/
+data/metadata/
+
+# ── Saved models / checkpoints ─────────────────────────────────────────────
+models/
+
+# ── Python cache ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Jupyter / Kaggle notebooks ──────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Distribution / packaging ────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# ── Testing & coverage ──────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+
+# ── Ruff / linter caches ────────────────────────────────────────────────────
+.ruff_cache/
+
+# ── OS artefacts ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE / editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Secrets / credentials ───────────────────────────────────────────────────
+.env
+*.pem
+kaggle.json
