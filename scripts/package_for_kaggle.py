@@ -2,19 +2,22 @@
 """
 package_for_kaggle.py — Package and upload preprocessed VoxGuard audio and metadata to Kaggle.
 
-This script structures the preprocessed dataset into a clean, self-describing directory:
+This script structures the preprocessed datasets into one combined Kaggle Dataset:
     <staging_dir>/
-      asvspoof2019/
+      asvspoof2019/       # Preprocessed 16kHz ASVspoof 2019 audio
         *.wav
-      wavefake/
+      wavefake/          # Preprocessed 16kHz WaveFake subset audio (named 'wavefake', not 'wavefake_subset')
         *.wav
-      in_the_wild/
+      in_the_wild/       # Preprocessed 16kHz In-the-Wild audio
         *.wav
       metadata/
-        unified.csv
+        unified.csv      # Direct copy of local data/metadata/unified.csv (with processed_path column)
 
-It then pushes the directory as a private Kaggle Dataset via `scripts/kaggle_sync.py`
-so that Phase 2's GPU embedding extraction notebook can mount it at `/kaggle/input/<dataset-slug>/`.
+Why one combined dataset:
+  - Phase 2's Master Kaggle Session requires only a SINGLE "Add Input" step to mount
+    all three dataset scopes at `/kaggle/input/<dataset-slug>/`.
+  - No separate metadata CSVs per subfolder; the single `metadata/unified.csv` simplifies
+    loading on Kaggle without needing multiple concatenation steps.
 
 Usage:
   # Create a new private Kaggle dataset
@@ -35,7 +38,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from voxguard.config import BASE_DIR, DATA_METADATA_DIR, DATA_PROCESSED_DIR
 from voxguard.utils.logging_utils import get_logger
@@ -44,7 +47,6 @@ from voxguard.utils.logging_utils import get_logger
 try:
     from scripts.kaggle_sync import upload_dataset
 except ImportError:
-    # If scripts is not in python path directly
     sys.path.insert(0, str(BASE_DIR))
     from scripts.kaggle_sync import upload_dataset
 
@@ -53,6 +55,19 @@ logger = get_logger("package_for_kaggle")
 DEFAULT_DATASET_NAME = "voxguard-preprocessed-data"
 DEFAULT_TITLE = "VoxGuard Preprocessed Audio and Unified Metadata"
 DEFAULT_STAGING_DIR = BASE_DIR / "data" / "kaggle_package"
+
+# Canonical subfolder names required for downstream Phase 2+ compatibility
+CANONICAL_DATASET_MAPPING = {
+    "asvspoof": "asvspoof2019",
+    "asvspoof2019": "asvspoof2019",
+    "asv_2019": "asvspoof2019",
+    "wavefake": "wavefake",
+    "wavefake_subset": "wavefake",
+    "wf": "wavefake",
+    "in_the_wild": "in_the_wild",
+    "in-the-wild": "in_the_wild",
+    "itw": "in_the_wild",
+}
 
 
 def get_default_kaggle_username() -> Optional[str]:
@@ -89,20 +104,42 @@ def resolve_dataset_slug(slug_arg: Optional[str]) -> str:
     )
 
 
+def canonicalize_dataset_folder_name(folder_name: str) -> str:
+    """Maps dataset folder names or subsets to standard canonical names."""
+    clean = folder_name.strip().lower().replace("-", "_")
+    return CANONICAL_DATASET_MAPPING.get(clean, clean)
+
+
+def compute_dir_stats(directory: Path) -> Tuple[int, float]:
+    """Computes total file count and size in megabytes for a directory."""
+    files = [f for f in directory.rglob("*") if f.is_file()]
+    total_bytes = sum(f.stat().st_size for f in files)
+    return len(files), total_bytes / (1024 * 1024)
+
+
 def prepare_kaggle_package(
     processed_dir: Path = DATA_PROCESSED_DIR,
     metadata_csv: Path = DATA_METADATA_DIR / "unified.csv",
     staging_dir: Path = DEFAULT_STAGING_DIR,
-    symlink_mode: bool = False,
 ) -> Path:
     """
-    Assembles processed audio folders and metadata/unified.csv into the staging directory.
+    Assembles processed audio folders and metadata/unified.csv into one combined staging directory.
+
+    Structure created:
+      <staging_dir>/
+        asvspoof2019/
+          *.wav
+        wavefake/
+          *.wav
+        in_the_wild/
+          *.wav
+        metadata/
+          unified.csv
 
     Args:
         processed_dir: Directory containing preprocessed audio subfolders.
         metadata_csv: Path to unified.csv metadata file.
         staging_dir: Destination packaging directory.
-        symlink_mode: If True, attempts symlinks/hardlinks instead of copying.
 
     Returns:
         Path: Resolved staging directory path.
@@ -116,26 +153,29 @@ def prepare_kaggle_package(
     if not meta_path.exists():
         raise FileNotFoundError(f"Unified metadata CSV not found at: {meta_path}")
 
-    logger.info(f"Preparing Kaggle package staging directory: {stage_path}")
+    logger.info(f"Preparing Kaggle combined package staging directory: {stage_path}")
     stage_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Stage metadata/unified.csv
+    # 1. Stage metadata/unified.csv (single combined metadata file)
     meta_subfolder = stage_path / "metadata"
     meta_subfolder.mkdir(parents=True, exist_ok=True)
     target_meta_file = meta_subfolder / "unified.csv"
     shutil.copy2(meta_path, target_meta_file)
     logger.info(f"Staged metadata -> {target_meta_file.relative_to(stage_path).as_posix()}")
 
-    # 2. Stage processed audio folders
+    # 2. Stage processed audio folders with canonical naming
     dataset_dirs = [p for p in proc_path.iterdir() if p.is_dir() and p.name != "metadata"]
-    total_staged_audio = 0
+    package_stats: Dict[str, Tuple[int, float]] = {}
 
     for ds_dir in dataset_dirs:
-        dest_ds_dir = stage_path / ds_dir.name
+        canonical_name = canonicalize_dataset_folder_name(ds_dir.name)
+        dest_ds_dir = stage_path / canonical_name
         dest_ds_dir.mkdir(parents=True, exist_ok=True)
 
         audio_files = list(ds_dir.glob("*.wav"))
-        logger.info(f"Staging {len(audio_files):,} audio clips for '{ds_dir.name}'...")
+        logger.info(
+            f"Staging {len(audio_files):,} audio clips from '{ds_dir.name}' into '{canonical_name}/'..."
+        )
 
         for audio_file in audio_files:
             target_audio = dest_ds_dir / audio_file.name
@@ -144,12 +184,28 @@ def prepare_kaggle_package(
                     os.link(audio_file, target_audio)
                 except Exception:
                     shutil.copy2(audio_file, target_audio)
-            total_staged_audio += 1
 
-    logger.info(
-        f"Kaggle package assembly complete: {total_staged_audio:,} audio files "
-        f"across {len(dataset_dirs)} datasets + metadata/unified.csv."
-    )
+        cnt, mb = compute_dir_stats(dest_ds_dir)
+        package_stats[canonical_name] = (cnt, mb)
+
+    meta_cnt, meta_mb = compute_dir_stats(meta_subfolder)
+    package_stats["metadata"] = (meta_cnt, meta_mb)
+
+    # Print summary table
+    logger.info("-" * 78)
+    logger.info("COMBINED KAGGLE PACKAGE BREAKDOWN:")
+    total_files = sum(s[0] for s in package_stats.values())
+    total_mb = sum(s[1] for s in package_stats.values())
+    total_gb = total_mb / 1024.0
+
+    for name, (cnt, mb) in sorted(package_stats.items()):
+        if name == "metadata":
+            logger.info(f"  - {name.ljust(16)}: {cnt:>7,} file(s)  ({mb:>8.2f} MB)")
+        else:
+            logger.info(f"  - {name.ljust(16)}: {cnt:>7,} wavs     ({mb:>8.2f} MB)")
+    logger.info(f"  TOTAL PACKAGE  : {total_files:>7,} file(s)  ({total_gb:>8.2f} GB)")
+    logger.info("-" * 78)
+
     return stage_path
 
 
@@ -185,7 +241,7 @@ def package_and_upload(
     mount_path = f"/kaggle/input/{dataset_id}/"
 
     logger.info("=" * 78)
-    logger.info("UPLOADING DATASET TO KAGGLE")
+    logger.info("UPLOADING COMBINED DATASET TO KAGGLE")
     logger.info(f"Target Slug : {slug}")
     logger.info(f"Title       : {title}")
     logger.info(f"Update Mode : {update}")
@@ -200,18 +256,22 @@ def package_and_upload(
         update=update,
     )
 
-    # 4. Print prominent instructions for Phase 2
+    # 4. Print prominent instructions for Phase 2 Master Session
     print("\n" + "=" * 78)
     print("KAGGLE DATASET UPLOAD COMPLETE!")
     print("=" * 78)
     print(f"  Dataset Slug : {slug}")
     print(f"  Dataset URL  : {dataset_url}")
     print(f"  Mount Point  : {mount_path}")
-    print("\nIMPORTANT FOR PHASE 2 GPU NOTEBOOKS:")
-    print(f"  1. Open your Phase 2 Kaggle GPU Notebook.")
-    print(f"  2. Click 'Add Input' -> 'Your Datasets' -> Search '{dataset_id}'.")
-    print(f"  3. Attach '{slug}'. It will mount at: {mount_path}")
-    print(f"  4. Keep this dataset slug noted down for all subsequent GPU notebook runs.")
+    print("\nIMPORTANT FOR MASTER KAGGLE GPU SESSION (Phase 2):")
+    print(f"  1. Open your Phase 2 Master Kaggle GPU Notebook.")
+    print(f"  2. Single 'Add Input' step -> 'Your Datasets' -> Attach '{slug}'.")
+    print(f"  3. All three datasets mount under: {mount_path}")
+    print(f"       - {mount_path}asvspoof2019/")
+    print(f"       - {mount_path}wavefake/")
+    print(f"       - {mount_path}in_the_wild/")
+    print(f"       - {mount_path}metadata/unified.csv")
+    print("  4. Save this dataset slug for all GPU notebook extractions.")
     print("=" * 78 + "\n")
 
     return dataset_url
@@ -219,7 +279,7 @@ def package_and_upload(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Package preprocessed VoxGuard datasets and upload as a private Kaggle Dataset."
+        description="Package preprocessed VoxGuard datasets into one combined private Kaggle Dataset."
     )
     parser.add_argument(
         "--slug",
