@@ -1,7 +1,9 @@
-# VoxGuard — Complete Vibe-Coding Build Guide (v3)
+# VoxGuard — Complete Vibe-Coding Build Guide (v4)
 ### SIH26104 — AI-Powered Real-Time Detection and Prevention of Voice Cloning Impersonation Attacks
 
 This guide turns `Techstack.md` and `voice_cloning_features.md` into a phase-by-phase build plan you can feed directly to a coding agent (Claude Code, Cursor, etc.), one phase — often one prompt — at a time.
+
+**v4 change:** built to make Phase 2-3's full three-dataset training/eval pipeline (ASVspoof2019 + WaveFake + In-the-Wild) actually fit inside **Kaggle's free tier (30 GPU-hours/week, 12-hour session cap) within a one-week solo build** — the scenario this revision was commissioned for: Phase 0 and Phase 1 Prompts 1.1-1.2 already complete, everything else still ahead, one week on the clock. Two changes drive it: (1) a defensible, stratified subset of WaveFake for cross-dataset eval — mirroring the subsetting pattern v3 already used for In-the-Wild, and already implied by v3's own Phase 1 disk-budget line ("...WaveFake subset...") but never actually implemented in Prompt 1.2's code, and (2) routing ALL embedding extraction — including the WaveFake/In-the-Wild cross-dataset eval that v3 left as local, uncached, file-by-file CPU inference via `detector.predict()` — through a single consolidated Kaggle session with proper caching. **Nothing about the classifier architecture, the feature set, or any of the 9 standout features changes** — this is a scheduling and data-plumbing fix to a real bottleneck v3 didn't fully account for, not a scope change. Phase 0 and Phase 1 Prompts 1.1-1.2 are byte-for-byte unchanged from v3 (they were already built when this revision was commissioned); Phases 5-11 are also unchanged from v3, since none of them touch Kaggle or the three-dataset pipeline. See Phase 1's new "Kaggle Free-Tier Master Strategy" section, inserted directly after Prompt 1.2, for the full reasoning, the GPU-hour math, and a day-by-day one-week schedule.
 
 **v2 change:** this revision is built for **local-first development on a CPU/iGPU-only laptop (no dedicated GPU)** — specifically profiled against an AMD Ryzen AI 7 350 (8-core Zen5/Zen5c, Radeon 860M iGPU, XDNA2 NPU) — using **Kaggle's free GPU tier** as the one deliberate cloud burst for the single step that genuinely needs a GPU (embedding extraction). Everything else — the app, streaming, training, cloning generation, and the live demo — runs entirely on the local machine, with no dependency on Colab quotas or a paid cloud tier. See Phase 0's new "Local Hardware Profile & Free-Service Workflow" section before starting.
 
@@ -44,6 +46,8 @@ This guide turns `Techstack.md` and `voice_cloning_features.md` into a phase-by-
 4. **Phase 6/8's privacy additions (session logging + voiceprint deletion, ~2h combined)** — cut last; these are cheap, and "privacy and compliance" being visibly addressed (even minimally) is worth more per hour spent than almost anything else on this list.
 
 Also still available from v2: Phase 4's Prompt 4.9 (optional data augmentation), Phase 4's stretch tier (stick to 3 speakers, not 4-5), and Phase 10's optional gradient-saliency method. Features 10 (Safe-Word Companion) and 11 (Generalization Dashboard) from the original standout list remain **intentionally excluded** — Phase 3 already produces the underlying generalization numbers in table form if you want to add a chart later, and Phase 8's enrollment flow is a natural base for a safe-word feature if you have hours left over. These hour estimates assume Phase 2/3/4's embedding-extraction steps run on Kaggle's free GPU tier as directed in Phase 0 — running that same step on CPU-only local hardware instead would multiply those specific sub-steps by roughly 8-15x, so don't skip the Kaggle setup to "save a step."
+
+**v4 addendum note:** the hour estimates above are unchanged from v3 — v4 doesn't add or remove build work, it fixes a scheduling gap in how Phase 1-3's dataset work was routed through Kaggle so the plan actually fits a one-week solo timeline without a hidden multi-day CPU bottleneck. See Phase 1's "Kaggle Free-Tier Master Strategy" section for the full reasoning and GPU-hour math, and its "Suggested One-Week Schedule" subsection for how these hours map onto seven days starting from Phase 1 Prompt 1.3.
 
 ---
 
@@ -120,6 +124,7 @@ Any voice cloning you generate for testing (Phase 4) or any voiceprint you enrol
 | `11_phase10_explainability.md` | Feature 9 (standout) |
 | `12_phase11_integration_deployment.md` | Final integration, **REST API layer (v3)**, HF Spaces deploy, privacy/compliance documentation, demo rehearsal |
 | `Buildguidev3.md` | All of the above concatenated into one file |
+| `BuildGuidev4.md` | **This file.** v3 concatenated, plus Phase 1's new "Kaggle Free-Tier Master Strategy" section (inserted after Prompt 1.2) and the resulting changes to Phases 1-3's Kaggle/dataset prompts. Phase 0 and Phase 1 Prompts 1.1-1.2 are unchanged; Phases 5-11 are unchanged. |
 
 ---
 # Phase 0 — Environment, Repo & Account Setup
@@ -448,6 +453,138 @@ subset, with a clear docstring saying the user should re-run with subset_size=No
 grading if they have the disk space and time.
 ```
 
+---
+
+## Kaggle Free-Tier Master Strategy (v4 — read this before Prompt 1.3)
+
+**Why this section exists.** v3's Kaggle usage was split across two separate visits (Phase 2 for wav2vec2, Phase 3 for WavLM), and its cross-dataset zero-shot eval (Phase 3, Prompt 3.1) was never routed through Kaggle at all — it calls `detector.predict()` once per file, which does its own embedding extraction internally, on whatever hardware runs it. Run locally on CPU against WaveFake's full release (commonly cited at over 100,000 clips across roughly half a dozen vocoder/TTS systems — treat that count as approximate until Prompt 1.2b below confirms exactly what you downloaded), that's the same order of magnitude as the 18-34 hour full-ASVspoof CPU extraction Phase 2 already warns against. That gap, not Kaggle's GPU-hour quota, is the real risk to a one-week timeline — and it's the thing this section actually fixes.
+
+### The constraint, stated plainly
+
+| Limit | Value | Source |
+|---|---|---|
+| Weekly GPU quota | 30 GPU-hours/week | Kaggle's published free-tier limit (Phase 0) |
+| Single-session runtime cap | 12 hours (GPU), then the kernel is killed regardless of progress | Kaggle notebook documentation |
+| `/kaggle/working` auto-saved output | 20 GB per notebook version | Kaggle notebook documentation |
+| Private Kaggle Dataset size | On the order of 100 GB (uncompressed) historically — verify the current figure in Kaggle's docs at upload time, since platform limits do change | Kaggle documentation (verify before committing to a packaging plan) |
+
+### Decision 1 — Subset WaveFake for cross-dataset eval, the same way v3 already subsetted In-the-Wild
+
+v3's own Phase 1 Prerequisites line already budgeted disk space for "ASVspoof2019 LA partition + **WaveFake subset**" — the intent to subset WaveFake was already there, it just was never wired into Prompt 1.2's actual code (only In-the-Wild got a `subset_size` parameter). v4 completes that: **Prompt 1.2b** below builds a stratified WaveFake eval subset (default 8,000 clips — the same order of magnitude as In-the-Wild's already-accepted 5,000 default, sized larger since WaveFake spans more generator systems to stratify across) from what you already downloaded in Prompt 1.2. The full WaveFake metadata and raw files are left untouched on disk, so a full-scale rerun stays possible later if time and Kaggle budget allow — this is the identical "well-documented subset is legitimate, an undocumented one is not" standard v3's Phase 1 Common Pitfalls already applied to In-the-Wild, just consistently extended to WaveFake.
+
+This is a scope-preserving efficiency decision, not a feature cut: Feature 2 (Cross-Dataset Generalization Layer, Phase 3) still evaluates on all three datasets, honestly, exactly as v3 specified — it just does so against a defensible, disclosed sample of WaveFake instead of its full ~100k+-clip release, the same tradeoff v3 already made for In-the-Wild without controversy.
+
+### Decision 2 — Consolidate all Kaggle GPU work into one session, with everything cached
+
+v3 spread GPU work across Phase 2 (wav2vec2 only) and Phase 3 (WavLM, plus an uncached local zero-shot eval). v4 pulls all of it into **one Master Kaggle Session**, executed once you reach Phase 2:
+
+- Both embedding backbones (wav2vec2 **and** WavLM — pulling Phase 3's pass forward)
+- All three dataset scopes (ASVspoof2019 full train/dev/eval, the WaveFake subset, the In-the-Wild subset)
+- Six extraction jobs total, all resumable independently, all downloaded and cached locally before you leave the session
+
+Phase 3 then reads everything it needs from local cache — see that phase's new "v4: Zero-Shot Eval Now Runs on Cached Embeddings" section for how `zero_shot_eval_from_cache` (new in v4) replaces the slow per-file path for full-scale runs, without changing `predict()`/`predict_waveform()`'s signatures that Phase 5 onward depends on.
+
+### Calibrate before you commit to a schedule
+
+Don't trust a canned throughput number — clip-length distribution, batch size, and which GPU Kaggle assigns you (T4 x2 vs P100) all move the real number. Before running the full six-job extraction, time a fixed batch. This reads directly from the packaged **processed** audio (globbed by extension, not through the metadata CSV) specifically so it doesn't depend on the same-session path-wiring you're about to test with the real run — deliberately the simplest possible thing that can fail:
+
+```
+# Run this FIRST in the Kaggle notebook, before the full extraction — takes under a minute
+import time, glob
+import numpy as np, soundfile as sf
+from src.voxguard.embeddings.extractor import EmbeddingExtractor
+sample_paths = glob.glob('/kaggle/input/<dataset-slug>/asvspoof2019/**/*.wav', recursive=True)[:1000]
+assert len(sample_paths) > 0, "No .wav files found under the attached input — check the dataset slug and Prompt 1.6's folder structure before going further"
+waveforms = [sf.read(p)[0].astype('float32') for p in sample_paths]
+ext = EmbeddingExtractor()
+t0 = time.time()
+ext.extract_batch(waveforms)
+elapsed = time.time() - t0
+print(f'{len(waveforms)/elapsed:.1f} clips/sec on this session\'s GPU — use this to sanity-check the plan below')
+```
+
+### Worked GPU-hour math (illustrative — recalibrate with your own number above)
+
+Using a deliberately conservative placeholder of **40 clips/sec** (a pessimistic floor for a base-sized transformer on a T4 with batched short 2-4 second clips — your calibration step will very likely beat this):
+
+| Job | Clips | × backbones | Forward passes | ÷ 40 clips/sec |
+|---|---|---|---|---|
+| ASVspoof2019 (train+dev+eval, official counts) | 121,461 | × 2 | 242,922 | ≈ 1.7 hours |
+| WaveFake subset (Prompt 1.2b default) | 8,000 | × 2 | 16,000 | ≈ 0.11 hours |
+| In-the-Wild subset (Prompt 1.2 default) | 5,000 | × 2 | 10,000 | ≈ 0.07 hours |
+| **Total** | | | | **≈ 1.9 GPU-hours** |
+
+Add session overhead (model downloads, `pip install`, attaching input, occasional restart) and budget **3-4 hours of wall-clock time across one, at most two, sessions**. That's comfortably inside both the 12-hour single-session cap and the 30-hour/week quota — even at 4x this pessimistic estimate (10 clips/sec, a genuinely bad-case throughput), total GPU time stays under 8 hours. **The 30-hour/week Kaggle quota is very unlikely to be this project's actual bottleneck** — the bottleneck v3 actually had was the uncached local CPU fallback described above, which this plan eliminates by construction.
+
+### The Master Kaggle Session Plan
+
+**Prep (no GPU, do this now — Prompts 1.2b through 1.6 below):**
+1. Run Prompt 1.2b to audit actual WaveFake/In-the-Wild counts and build the stratified WaveFake subset.
+2. Run Prompt 1.3 to build `data/metadata/unified.csv` (raw `filepath` rows at this point — no `processed_path` yet).
+3. Run Prompt 1.4's preprocessing over all three: ASVspoof2019 (full), WaveFake (subset only), In-the-Wild (subset, already default from Prompt 1.2) — and confirm its v4 fix actually ran: `data/metadata/unified.csv` should now have a populated `processed_path` column, not just `filepath`. This is the single most load-bearing file in the whole v4 plan; if this step is skipped, everything from here through Phase 3's cache-based eval breaks in ways that won't necessarily fail loudly.
+4. Run Prompt 1.6 to package all three into **one** combined Kaggle Dataset (three audio subfolders + one `metadata/unified.csv`, one slug, one "Add Input" step) and upload it.
+
+**Session 1 (GPU — do this at the start of Phase 2; budget ~3-4 hours wall-clock):**
+1. Open a Kaggle Notebook. Settings → Accelerator → GPU T4 x2 (or P100). Settings → Internet → On.
+2. `!git clone` your repo, "Add Input" → attach the single combined dataset from the prep step, `pip install` any missing dependencies, then symlink the audio subfolders and copy `metadata/unified.csv` into place (full commands in Phase 2's Kaggle workflow section — this is the part that makes the code run unmodified whether it's on your laptop or here).
+3. Run the calibration cell above; note your actual clips/sec.
+4. Extract wav2vec2 embeddings: ASVspoof train/dev/eval, then the WaveFake subset, then the In-the-Wild subset.
+5. Extract WavLM embeddings for the same three scopes — this is v3's Phase 3 pass, pulled forward so Kaggle is only opened once.
+6. Download all six `.npy`/`.csv` pairs (`kaggle_sync.py`'s `download_output()`, or "Save Version" + manual download) into local `models/embeddings/`.
+7. If a 12-hour boundary is approaching before all six finish, "Save Version" to persist completed jobs (each is independently resumable) and finish the rest in a short second session — the math above shows you should have five-plus weekly hours of slack even in the pessimistic case.
+
+**Session 2:** only if Session 1 didn't finish everything. Most builds following this plan won't need it. Phase 3, under this plan, needs **zero further Kaggle sessions**.
+
+### Suggested One-Week Schedule
+
+Grounded in this guide's own per-phase hour estimates (Feature → Phase Map table above), starting from "Phase 0 and Phase 1 Prompts 1.1-1.2 done." Remaining work totals roughly 70-71 hours across 7 days — about 10 hours/day on average, which is aggressive; treat this as a starting point to adjust to your own capacity, not a guarantee.
+
+| Day | Focus | Notes |
+|---|---|---|
+| 1 | Finish Phase 1 (Prompts 1.2b-1.6, ~3-4h) + write/smoke-test Phase 2's Prompts 2.1-2.6 locally (no GPU needed yet) | Kick off ASVspoof registration on day 1 if not already approved — see Phase 0 |
+| 2 | Run Master Kaggle Session 1 (background, ~3-4h wall-clock) while continuing Phase 2 local work; finish Phase 2; do Phase 3 (should need ~0 new Kaggle time, ~4h) | Phase 3 is unusually fast this week specifically because Session 1 already did its GPU work |
+| 3 | Phase 4 — Hindi/Hinglish track (~9-10h, the single largest remaining phase) | XTTS-v2 generation (Prompt 4.3) runs as a local CPU background batch job — kick it off, work on the rest of the phase while it runs |
+| 4 | Phase 5 (~5h) + Phase 6 (~7h) | **Go/no-go checkpoint at end of today** — if meaningfully behind, use the priority cut list in this file's Feature → Phase Map section (API layer first, then contextual enrichment, then prosody, then privacy additions last) |
+| 5 | Phase 7 (~3h) + Phase 8 (~7.5h) | |
+| 6 | Phase 9 (~9h) | The single largest remaining phase after Phase 4 — if day 4's checkpoint flagged you as behind, this is a candidate to trim via Prompt 9.5-9.6 per the cut list |
+| 7 | Phase 10 (~4h) + Phase 11 (~8.5h) | Tightest day in the plan (~12.5h) — start Phase 11's HF Spaces account and README skeleton earlier in the week on any lighter day if slack appears |
+
+### Master Strategy — Definition of Done
+
+- [ ] Ran the WaveFake/In-the-Wild count audit and built a stratified, documented WaveFake eval subset (Prompt 1.2b)
+- [ ] Preprocessed and packaged all three datasets into one combined Kaggle Dataset (Prompt 1.6, v4 addition)
+- [ ] Ran the calibration cell on an actual Kaggle GPU session before committing to the full extraction
+- [ ] Master Kaggle Session 1 completed: wav2vec2 AND WavLM embeddings extracted and cached locally for all three dataset scopes
+- [ ] Confirmed Phase 3 needs zero (or near-zero) additional Kaggle time
+- [ ] Reviewed the one-week schedule and adjusted it against your own actual daily capacity
+
+---
+
+### Prompt 1.2b — Audit dataset scale and build a stratified WaveFake eval subset
+
+```
+Write scripts/audit_and_subset_wavefake.py that:
+1. Loads data/metadata/wavefake.csv (built by Prompt 1.2) and data/metadata/in_the_wild.csv,
+   and prints total row counts, plus counts broken down by label (bonafide/spoof) and, for
+   WaveFake, by the "generator" column — this confirms exactly what you actually downloaded
+   before deciding anything, rather than assuming a number from documentation.
+2. Builds a stratified subset of WaveFake sized by a --subset_size argument (default 8000),
+   sampling proportionally across BOTH label AND generator so no single vocoder/TTS system
+   dominates the eval story (use sklearn's train_test_split with a combined label+generator
+   stratification key, or a pandas groupby-sample if the smallest stratum is too small for
+   sklearn's stratify to handle — fall back gracefully and warn if any generator has fewer than
+   20 total samples, since that group can't be meaningfully subsampled further).
+3. Saves the result to data/metadata/wavefake_subset.csv, and leaves data/metadata/wavefake.csv
+   (the full set) completely untouched, so a full-scale WaveFake eval remains possible later if
+   time and Kaggle budget allow.
+4. Prints a before/after summary table (total clips, per-generator breakdown, before vs after
+   subsetting) suitable for pasting into a dataset-card-style note about why this subset was
+   used — this is the same documented-subset standard v3's Common Pitfalls already required for
+   In-the-Wild, consistently extended to WaveFake here.
+Do NOT re-download or delete any raw WaveFake files — this only changes which rows downstream
+preprocessing (Prompt 1.4) and packaging (Prompt 1.6) operate on.
+```
+
 ### Prompt 1.3 — Unified metadata schema
 
 ```
@@ -460,6 +597,12 @@ else "unknown")]. Also implement save_unified_metadata() to cache the combined r
 data/metadata/unified.csv. Add unit tests in tests/test_metadata.py checking the label mapping
 and that no filepath is null after loading.
 ```
+
+**v4 addition to Prompt 1.3:** two changes to `load_unified_metadata`:
+1. It should read WaveFake's metadata from `data/metadata/wavefake_subset.csv` (Prompt 1.2b) by default when `"wavefake"` is requested, falling back to the full `data/metadata/wavefake.csv` only if the subset file doesn't exist. Add an explicit `use_full_wavefake: bool = False` parameter so using the full set is always an intentional override, never a silent default in either direction.
+2. **(v4 fix — closes a gap in v3's original spec):** before rebuilding from the raw per-dataset CSVs, check whether `data/metadata/unified.csv` already exists AND its rows for the requested `dataset_names` already have a non-null `processed_path` column — if so, load and filter FROM `unified.csv` instead of rebuilding from source. Without this, `load_unified_metadata` as originally specified would rebuild from `data/metadata/wavefake_subset.csv` etc. every time it's called — which never has `processed_path` on it — silently discarding the column Prompt 1.4 added, no matter how many times `unified.csv` gets re-saved. This is what lets the SAME function correctly serve both the pre-preprocessing stage (Prompts 1.3-1.5, returns raw `filepath` rows) and everything from Phase 2 onward (returns `processed_path`-complete rows), including this file's v4 dataset-scoped extraction, without needing two different loader functions.
+
+Everything else about this function (label mapping, schema, null-checks) is exactly as specified above — this is additive, not a rewrite.
 
 ### Prompt 1.4 — Preprocessing pipeline
 
@@ -476,6 +619,12 @@ output already exists. Log progress every 500 files using the logging_utils logg
 the first 20 files of each dataset for a quick smoke test.
 ```
 
+**v4 note on Prompt 1.4:** no code changes needed — `preprocess_dataset` already operates on whatever rows the DataFrame it's given contains. Because Prompt 1.3 now feeds it the WaveFake *subset* by default (not the full 100k+-clip release), this step's wall-clock time drops substantially — expect well under an hour for WaveFake's share instead of a multi-hour local CPU job. If you deliberately pass `use_full_wavefake=True` upstream, budget accordingly; that tradeoff is now explicit rather than accidental.
+
+**v4 fix — where `processed_path` actually gets saved (closes a gap in v3's original spec):** v3 never explicitly stated where the `processed_path`-augmented DataFrame `preprocess_dataset` returns gets persisted, even though `get_asvspoof_splits` (Prompt 1.5), `package_for_kaggle.py` (Prompt 1.6), and this file's dataset-scoped extraction (Prompt 2.2, v4) all depend on it existing on disk. Have `scripts/run_preprocessing.py` call `save_unified_metadata()` (Prompt 1.3) again on the returned DataFrame, **overwriting** `data/metadata/unified.csv` — combined with Prompt 1.3's v4 cache-preference fix above, this is what makes `load_unified_metadata` return `processed_path`-complete rows from this point in the pipeline onward. Store `processed_path` as a path **relative to the repo root** (e.g. `data/processed/asvspoof2019/xxx.wav`), not an absolute local path — this is what makes the Kaggle symlink approach in Phase 2's workflow section resolve correctly with zero path-rewriting, on Kaggle or locally, without any code change between environments.
+
+**Guard this behind `--dry_run` (v4, important):** this phase's Tests section runs `python scripts/run_preprocessing.py --dry_run`, which only processes the first 20 files per dataset. If the resave above fires on a dry run too, it would overwrite `unified.csv` with a 20-row-per-dataset DataFrame, silently destroying the full metadata the moment someone follows this guide's own recommended test command. Only call `save_unified_metadata()` on a real (non-`--dry_run`) run.
+
 ### Prompt 1.5 — Train/val/test split respecting official protocols
 
 ```
@@ -487,6 +636,8 @@ eval in Phase 3), return the full processed set as a single eval-only split sinc
 trained on. Raise a clear error if called on a dataset with no known official split logic
 implemented yet.
 ```
+
+**v4 note on Prompt 1.5:** no code change — "the full processed set" here now means whatever Prompt 1.3/1.4 actually processed, which is the WaveFake *subset* by default (Prompt 1.2b) unless `use_full_wavefake=True` was set upstream. The split logic itself is unaffected either way.
 
 ### Prompt 1.6 — Package preprocessed data for Kaggle
 
@@ -502,11 +653,14 @@ it to attach the dataset. Support --update to push a new version if the processe
 later (e.g., after Phase 4 adds the Hindi/Hinglish track and it needs to be included too).
 ```
 
+**v4 addition to Prompt 1.6:** structure the packaged output as **one** combined Kaggle Dataset: three top-level audio subfolders — `asvspoof2019/`, `wavefake/`, `in_the_wild/` (named to match the `dataset` values used everywhere else in this guide — `--dataset wavefake`, `load_unified_metadata(['wavefake'])`, `{model}_wavefake.npy` — not `wavefake_subset/`, which would be a needless naming mismatch, even though the *content* is the Prompt 1.2b subset) — plus **one** top-level `metadata/unified.csv`, a straight copy of the local `data/metadata/unified.csv` Prompt 1.4's fix already made `processed_path`-complete. Don't package a separate metadata CSV per subfolder; one merged file is simpler to reconstruct on the Kaggle side (see Phase 2's workflow, which copies this single file into place rather than concatenating several). One combined dataset means the Master Kaggle Session (see "Kaggle Free-Tier Master Strategy" above) needs only a single "Add Input" step to reach everything it extracts embeddings for. Expect combined size in the low tens of GB after WaveFake's subsetting — comfortably clear of Kaggle's private-dataset size ceiling, which has historically been on the order of 100 GB; verify the current figure in Kaggle's docs at upload time rather than assuming it, since platform limits change. If the packaged size still feels uncomfortably large, lowering `--subset_size` on Prompt 1.2b (WaveFake) or Prompt 1.2 (In-the-Wild) and re-running is a one-line change, not a re-download.
+
 ---
 
 ## Tests
 
 ```
+python scripts/audit_and_subset_wavefake.py --subset_size 8000   # v4: run this first
 python -m pytest tests/test_metadata.py -q
 python scripts/run_preprocessing.py --dry_run
 python -c "
@@ -515,6 +669,25 @@ df = load_unified_metadata(['asvspoof2019'])
 assert df['label'].isin(['real','synthetic']).all()
 assert df['filepath'].notnull().all()
 print(df['label'].value_counts())
+"
+python -c "
+# v4: confirm the WaveFake subset is actually stratified, not just truncated
+import pandas as pd
+df = pd.read_csv('data/metadata/wavefake_subset.csv')
+print(df.groupby(['label','generator']).size())
+assert df['generator'].nunique() > 1, 'Subset collapsed to a single generator — check stratification'
+"
+python scripts/run_preprocessing.py   # the FULL run, not --dry_run — v3 never actually stated this
+                                        # step explicitly; without it nothing past this point has
+                                        # real audio to work with
+python -c "
+# v4: confirm processed_path actually made it back into unified.csv for ALL rows, not just the
+# dry-run's 20 — this is the single most load-bearing check in this whole phase
+from src.voxguard.utils.metadata import load_unified_metadata
+df = load_unified_metadata(['asvspoof2019', 'wavefake', 'in_the_wild'])
+assert 'processed_path' in df.columns, 'processed_path missing — Prompt 1.4 v4 fix did not run'
+assert df['processed_path'].notnull().all(), 'Some rows never got preprocessed — check for silent failures'
+print(df.groupby('dataset').size())
 "
 python scripts/package_for_kaggle.py
 ```
@@ -525,6 +698,7 @@ Manual checks:
 - [ ] Spot-play 3-5 random processed files per dataset — audio should be audible, not silent or corrupted
 - [ ] `data/metadata/unified.csv` has no null filepaths and a sane real/synthetic balance per dataset
 - [ ] Preprocessing script is resumable — kill it mid-run and re-run, confirm it skips already-processed files instead of redoing them
+- [ ] (v4) WaveFake subset's per-generator breakdown looks proportionate to the full set's breakdown printed by Prompt 1.2b — no single generator disappeared or dominates
 
 ## Definition of Done Checklist
 
@@ -536,6 +710,10 @@ Manual checks:
 - [ ] Official ASVspoof2019 train/dev/eval split preserved (not re-shuffled)
 - [ ] Total disk usage checked and within your machine's budget
 - [ ] Preprocessed data packaged and uploaded as a private Kaggle Dataset, ready for Phase 2's GPU notebook to attach
+- [ ] (v4) WaveFake audited (Prompt 1.2b) and a stratified, documented eval subset built — full WaveFake metadata preserved untouched for a possible future full-scale rerun
+- [ ] (v4) All three datasets packaged into ONE combined Kaggle Dataset (three audio subfolders + one `metadata/unified.csv`, one slug) — not three separate uploads
+- [ ] (v4) `scripts/run_preprocessing.py` run WITHOUT `--dry_run` at least once, and `unified.csv` confirmed to have `processed_path` populated for every row across all three datasets, not just the 20-file smoke test
+- [ ] (v4) Reviewed the "Kaggle Free-Tier Master Strategy" section above and understand the Master Kaggle Session Plan before starting Phase 2
 
 ## Common Pitfalls
 
@@ -543,6 +721,9 @@ Manual checks:
 - Silence-trimming too aggressively on very short utterances can produce empty audio — guard against zero-length output in the preprocessing function.
 - If In-the-Wild's full download is impractical on your connection/disk, a well-documented stratified subset is a legitimate and defensible choice — an undocumented one is not. Say so in your README.
 - Package and upload only `data/processed/` (16kHz mono WAVs) to Kaggle, not `data/raw/` — the raw archives are much larger and Phase 2's GPU notebook only needs the preprocessed audio.
+- (v4) Subsetting WaveFake without stratifying by generator would silently bias the cross-dataset eval toward whichever vocoder happens to be overrepresented in a naive random sample — always stratify (Prompt 1.2b handles this; don't hand-roll a simpler `df.sample(n)` instead).
+- (v4) `--dry_run` must never trigger the `unified.csv` resave (Prompt 1.4's v4 fix) — if it does, running this phase's own recommended `--dry_run` test command silently truncates your entire metadata down to 20 rows per dataset. If `package_for_kaggle.py` or Phase 2 ever complain about a suspiciously small dataset, check `unified.csv`'s row count against what you expect before assuming the bug is elsewhere.
+- (v4) Packaging the three datasets as three separate Kaggle Dataset uploads instead of one combined dataset means three separate "Add Input" steps in the Master Kaggle Session and more chances to forget one mid-session — combine them into one dataset with subfolders.
 
 ---
 # Phase 2 — Embedding + Classifier Core
@@ -563,24 +744,37 @@ The problem statement names "prosody and behavioral analysis — modeling speech
 
 ## Prerequisites
 
-- Phase 1 complete: `data/processed/` populated, ASVspoof2019 official splits available via `get_asvspoof_splits`, preprocessed data already uploaded as a Kaggle Dataset (Phase 1 Prompt 1.6)
+- Phase 1 complete: `data/processed/` populated, ASVspoof2019 official splits available via `get_asvspoof_splits`, all three datasets packaged and uploaded as ONE combined Kaggle Dataset (Phase 1 Prompt 1.6, v4)
 - Kaggle account with phone verification done and `kaggle.json` API token installed (Phase 0)
-- HuggingFace account logged in (needed for auto-download of `facebook/wav2vec2-base`)
+- HuggingFace account logged in (needed for auto-download of `facebook/wav2vec2-base` and `microsoft/wavlm-base-plus`)
+- (v4) Reviewed Phase 1's "Kaggle Free-Tier Master Strategy" section — this phase is where you actually execute Master Kaggle Session 1
 
 ## Local Hardware Note
 
-This is the one phase where local CPU-only hardware genuinely matters. Everything you *write and test* in this phase (correctness on a handful of files) runs fine locally on the Ryzen laptop. The *full-dataset production run* (all of train/dev/eval, ~121k clips) should run on a Kaggle GPU notebook instead — see the workflow below. Don't run the full extraction locally; budget it for Kaggle from the start.
+This is the one phase where local CPU-only hardware genuinely matters. Everything you *write and test* in this phase (correctness on a handful of files) runs fine locally on the Ryzen laptop. The *full-dataset production run* (all of train/dev/eval, ~121k clips, plus the cross-dataset scopes) should run on a Kaggle GPU notebook instead — see the workflow below. Don't run the full extraction locally; budget it for Kaggle from the start.
 
-## Kaggle GPU Notebook Workflow (for the full-dataset extraction run)
+## Kaggle GPU Notebook Workflow (v4 — executes Phase 1's Master Kaggle Session Plan)
+
+**v4 change from v3:** this session now also does WavLM extraction (v3 deferred that to Phase 3) and extracts embeddings for the WaveFake/In-the-Wild cross-dataset eval scopes (v3 left those to an uncached local CPU path in Phase 3 that this revision found to be a real one-week-timeline risk — see Phase 1's Master Strategy section for the full reasoning). Read that section first if you haven't; these are the mechanics, that section has the reasoning and GPU-hour math.
 
 1. **Write and smoke-test locally first.** Implement Prompts 2.1-2.2 and run the small local smoke test in this phase's Tests section (a handful of files) to confirm correctness before spending any Kaggle GPU time on it — debugging is much faster locally than iterating inside a notebook session.
-2. **Open a new Kaggle Notebook.** Settings → Accelerator → **GPU T4 x2** (or P100 if offered). Settings → Internet → **On** (needed for `pip install` and downloading `facebook/wav2vec2-base` / `microsoft/wavlm-base-plus` from HuggingFace).
-3. **Attach your Phase 1 dataset.** "Add Input" → search for the private dataset slug you noted from Prompt 1.6 → it mounts read-only at `/kaggle/input/<dataset-slug>/`.
-4. **Install any extra dependencies** not already in the Kaggle base image (Kaggle notebooks ship with `torch`+CUDA and `transformers` preinstalled already, which covers most of this phase — you'll likely only need `pip install soundfile` or similar small additions; check against your `requirements.txt`).
-5. **Point the code at Kaggle's paths.** Either pass `--processed_dir /kaggle/input/<dataset-slug>/processed` as an override to `scripts/extract_embeddings.py`, or symlink it to match your local `data/processed/` path — whichever is less code. Output embeddings to `/kaggle/working/` (Kaggle's writable output directory).
-6. **Run the full extraction** for each split × model combination (`--split train/dev/eval --model wav2vec2`, then repeat for `--model wavlm` when you reach Phase 3). It's resumable (Prompt 2.2's `output_path already exists` check) — if a Kaggle session times out partway through, just re-run in a fresh session and it picks up where it left off, as long as you've saved intermediate outputs (step 7).
-7. **Persist and pull the results back.** Either "Save Version" on the notebook (Kaggle keeps output files attached to that version, downloadable from the notebook's Output tab) or use `scripts/kaggle_sync.py`'s `download_output()` (Phase 0, Prompt 0.6) from your local machine once the run completes. Drop the downloaded `.npy`/`.csv` pairs into your local `models/embeddings/`, matching Prompt 2.2's naming convention exactly.
-8. **Track your 30 GPU-hours/week budget.** Kaggle shows remaining weekly quota in the notebook's Settings panel. A full wav2vec2 pass over train+dev+eval is a small fraction of that — you have plenty of headroom for iteration and for Phase 3/4's additional passes.
+2. **Open a new Kaggle Notebook.** Settings → Accelerator → **GPU T4 x2** (or P100 if offered). Settings → Internet → **On** (needed for `pip install`, `git clone`, and downloading `facebook/wav2vec2-base` / `microsoft/wavlm-base-plus` from HuggingFace).
+3. **Clone your code onto the notebook** (v4, new — neither v3 nor the steps below work without this, and it was never actually stated). Kaggle notebooks start empty except for the attached input; your `src/voxguard` package has to get there somehow. Simplest: `!git clone https://github.com/<you>/voxguard.git` as the first cell (your repo from Phase 0), then `%cd voxguard`. If the repo is private, don't paste a token into the notebook cell in plaintext — add it via Kaggle's **Add-ons → Secrets** and read it as an environment variable instead (`!git clone https://$GITHUB_TOKEN@github.com/<you>/voxguard.git`).
+4. **Attach your Phase 1 combined dataset.** "Add Input" → search for the single dataset slug you noted from Prompt 1.6 (v4: now one dataset covering all three sources) → it mounts read-only at `/kaggle/input/<dataset-slug>/`.
+5. **Install any extra dependencies** not already in the Kaggle base image (Kaggle notebooks ship with `torch`+CUDA and `transformers` preinstalled already, which covers most of this phase — you'll likely only need `pip install soundfile` or similar small additions; check against your `requirements.txt`).
+6. **Reconstruct the local layout the code expects** (v4, made explicit): symlink each attached audio subfolder to where the code looks for it locally, and copy the single packaged metadata file into place:
+   ```
+   !mkdir -p data/processed data/metadata
+   !ln -s /kaggle/input/<dataset-slug>/asvspoof2019 data/processed/asvspoof2019
+   !ln -s /kaggle/input/<dataset-slug>/wavefake     data/processed/wavefake
+   !ln -s /kaggle/input/<dataset-slug>/in_the_wild  data/processed/in_the_wild
+   !cp /kaggle/input/<dataset-slug>/metadata/unified.csv data/metadata/unified.csv
+   ```
+   This is what makes `load_unified_metadata` (Prompt 1.3, v4) resolve `processed_path` correctly on Kaggle with zero code changes — the exact same calls that work locally now work here, because the relative paths inside `unified.csv` now resolve through these symlinks. Output embeddings to `/kaggle/working/` (Kaggle's writable output directory) via `--output_dir` if `scripts/extract_embeddings.py` supports it, or write there directly.
+7. **Run the calibration cell** (v4, new — see Phase 1's Master Strategy section for the exact code) before committing to the full run, so your session plan is based on this session's actual throughput, not a guess.
+8. **Run the full extraction — six jobs total, all in this same session (v4):** `--dataset asvspoof2019 --split train/dev/eval --model wav2vec2`, then `--dataset wavefake --model wav2vec2`, then `--dataset in_the_wild --model wav2vec2`, then repeat all three with `--model wavlm`. Each job is independently resumable (Prompt 2.2's `output_path already exists` check) — if the session times out partway through, "Save Version," open a fresh session, and it picks up where it left off.
+9. **Persist and pull the results back.** Either "Save Version" on the notebook (Kaggle keeps output files attached to that version, downloadable from the notebook's Output tab) or use `scripts/kaggle_sync.py`'s `download_output()` (Phase 0, Prompt 0.6) from your local machine once the run completes. Drop all six downloaded `.npy`/`.csv` pairs into your local `models/embeddings/`, matching Prompt 2.2's (now dataset-scoped) naming convention exactly.
+10. **Track your 30 GPU-hours/week budget.** Kaggle shows remaining weekly quota in the notebook's Settings panel. Per Phase 1's worked math, all six jobs together should be a small fraction of that — you have plenty of headroom, and (v4) this should be the ONLY Kaggle session the whole project needs; Phase 3 reads from the cache this session produced rather than opening Kaggle again.
 
 ---
 
@@ -631,6 +825,10 @@ extract_and_cache, and saves to models/embeddings/{model}_{split}.npy (or /kaggl
 places: a local smoke test on a handful of files, a full run on a Kaggle GPU notebook (primary —
 see this phase's Kaggle workflow section), and Colab as a backup if Kaggle is ever unavailable.
 ```
+
+**v4 addition to Prompt 2.2:** generalize `scripts/extract_embeddings.py`'s CLI with a `--dataset` argument (`asvspoof2019` / `wavefake` / `in_the_wild`, defaulting to `asvspoof2019` so v3's original behavior is preserved exactly when unspecified). For `asvspoof2019`, behavior is unchanged (uses `get_asvspoof_splits` and `--split`). For `wavefake` and `in_the_wild`, call `load_unified_metadata(['wavefake'])` / `(['in_the_wild'])` (Phase 1, Prompt 1.3) — **not** `get_asvspoof_splits`, which is ASVspoof-specific and will raise on these — and use the returned DataFrame directly, filtered to that dataset name if `load_unified_metadata` was called with more than one name. This is deliberate: it reuses the exact same `unified.csv` (already carrying `processed_path` once Prompt 1.4's run has re-saved it, per that prompt's v4 fix) rather than re-reading `data/metadata/wavefake_subset.csv` directly, which only has `[filepath, label, generator]` and no `processed_path` — reading it directly would point `extract_and_cache` at nonexistent (unprocessed, and on Kaggle, non-uploaded) files. Treat the whole returned DataFrame as one eval-only batch (`--split` is unused for these two, consistent with Prompt 1.5's eval-only split logic). Output filenames become `models/embeddings/{model}_{dataset}.npy` for these two (e.g. `wav2vec2_wavefake.npy`), extending — not replacing — the existing `{model}_{split}.npy` convention used for ASVspoof2019. This is what lets the Master Kaggle Session run all six extraction jobs through the exact same script and Kaggle setup.
+
+**v4 correction — ignore the `--processed_dir` override mentioned above:** the original prompt text above describes overriding `--processed_dir` to `/kaggle/input/<dataset-slug>/processed` as the way to point the script at Kaggle's paths. Don't build that — it doesn't match what Prompt 1.6 actually packages (three separate `asvspoof2019/`/`wavefake/`/`in_the_wild/` folders, not one `processed/` folder), and it's unnecessary duplicate machinery. Phase 2's Kaggle workflow (step 6) uses the symlink approach exclusively — `data/processed/{dataset}` symlinked per dataset, `data/metadata/unified.csv` copied into place — so `processed_path` values resolve identically on Kaggle and locally with zero CLI flags or code branches for "which environment am I in." Skip implementing the `--processed_dir` argument; `--output_dir` (for where the resulting `.npy`/`.csv` go) is the only Kaggle-relevant flag actually needed.
 
 ### Prompt 2.3 — Prosody & behavioral feature extractor
 
@@ -685,6 +883,8 @@ This is the ONE place feature concatenation happens in the whole project — Pha
 and Phase 4's Hindi training should both call this function rather than writing their own
 concatenation logic, so a bug fix here fixes every phase at once.
 ```
+
+**v4 addition to Prompt 2.4 — naming convention for the real prosody caches (closes a gap in v3's original spec):** v3 never actually named the output files Prompts 2.5/2.6 read prosody features from — only the smoke-test example above (`prosody_dev_smoke.npy`) has an explicit name anywhere in this guide. Standardize on `models/embeddings/prosody_{split}.npy` for ASVspoof2019 (`prosody_train.npy`, `prosody_dev.npy`, `prosody_eval.npy`), mirroring `extract_embeddings.py`'s `{model}_{split}.npy` convention exactly. This is what Prompt 2.5/2.6 below should actually write to and read from, and it's what `resolve_cache_path` (Phase 3, Prompt 3.1, v4) assumes when resolving the prosody path for `dataset == "asvspoof2019"`.
 
 ### Prompt 2.5 — Classifier head training (baseline vs. prosody-augmented)
 
@@ -807,7 +1007,19 @@ extract_and_cache_prosody(dev_df.head(20), 'models/embeddings/prosody_dev_smoke.
 "
 
 # Full-dataset run happens on Kaggle for embeddings (see this phase's Kaggle workflow section
-# above) and locally for prosody (Prompt 2.4 — fast enough not to need Kaggle), then:
+# above) and locally for prosody (Prompt 2.4 — fast enough not to need Kaggle). v4: this single
+# Kaggle session also covers WavLM and the cross-dataset scopes, run in the SAME session:
+#   python scripts/extract_embeddings.py --dataset asvspoof2019 --split train --model wav2vec2
+#   python scripts/extract_embeddings.py --dataset asvspoof2019 --split dev   --model wav2vec2
+#   python scripts/extract_embeddings.py --dataset asvspoof2019 --split eval  --model wav2vec2
+#   python scripts/extract_embeddings.py --dataset wavefake                   --model wav2vec2
+#   python scripts/extract_embeddings.py --dataset in_the_wild                --model wav2vec2
+#   python scripts/extract_embeddings.py --dataset asvspoof2019 --split train --model wavlm
+#   python scripts/extract_embeddings.py --dataset asvspoof2019 --split dev   --model wavlm
+#   python scripts/extract_embeddings.py --dataset asvspoof2019 --split eval  --model wavlm
+#   python scripts/extract_embeddings.py --dataset wavefake                   --model wavlm
+#   python scripts/extract_embeddings.py --dataset in_the_wild                --model wavlm
+# then, back on your local machine once all outputs are downloaded to models/embeddings/:
 python scripts/train_classifier.py
 python scripts/evaluate_classifier.py
 python -m src.voxguard.classifier.infer data/processed/asvspoof2019/<some_eval_file>.wav
@@ -826,6 +1038,9 @@ Sanity thresholds to check in the eval report:
 - [ ] Thread-count benchmark run locally, `torch.set_num_threads()` set to whichever value was actually faster (don't assume — verify)
 - [ ] Full train/dev/eval embeddings extracted on a Kaggle GPU notebook and downloaded back to local `models/embeddings/`, resumable
 - [ ] Full train/dev/eval prosody features extracted LOCALLY (no Kaggle needed), resumable
+- [ ] (v4) Calibration cell run on an actual Kaggle GPU session and compared against Phase 1's worked estimate before committing to the full six-job run
+- [ ] (v4) WavLM embeddings for ASVspoof train/dev/eval extracted in this SAME Kaggle session (pulled forward from Phase 3) — Phase 3 should need zero additional Kaggle time
+- [ ] (v4) wav2vec2 AND WavLM embeddings extracted and cached for the WaveFake subset and In-the-Wild subset, in this same session
 - [ ] `load_combined_features` correctly concatenates and validates manifest alignment — confirm it actually raises on a deliberately misaligned pair, not just that it succeeds on an aligned one
 - [ ] All four classifier variants (baseline-logreg, baseline-mlp, prosody-logreg, prosody-mlp) trained and saved with distinguishing filenames
 - [ ] `compute_eer` implemented and validated against a hand-checkable toy example (e.g., perfectly separated scores should give EER ≈ 0)
@@ -844,6 +1059,8 @@ Sanity thresholds to check in the eval report:
 - If a `pip install` inside the Kaggle notebook seems to hang or fail, confirm the notebook's Internet toggle (Settings → Internet) is actually On — it's off by default on new notebooks and is a common silent blocker.
 - **Row-order misalignment between an embedding cache and a prosody cache is the single most dangerous silent bug this phase can introduce** — if the two were extracted from DataFrames sorted or filtered differently, concatenating them without `load_combined_features`'s manifest validation would pair each clip's embedding with a DIFFERENT clip's prosody vector. Always go through `load_combined_features`, never concatenate the raw `.npy` arrays directly.
 - Using `librosa.pyin` instead of `librosa.yin` will work but is noticeably slower — fine for the one-time batch extraction in this phase, but if you're tempted to reuse `ProsodyFeatureExtractor` anywhere in the Phase 5 streaming path, confirm you kept `yin`, since `pyin`'s extra cost compounds badly per-chunk.
+- (v4) Don't split the wav2vec2 and WavLM extraction across two separate Kaggle visits "to keep the phases clean." The entire point of the v4 consolidation is running both backbones, across all three dataset scopes, in one sitting — splitting it back apart reintroduces the session-setup overhead (and the risk of forgetting to come back for the second half) this revision exists to remove.
+- (v4) If you skip the calibration cell and the full six-job run looks like it will blow past 12 hours, don't panic-cut a dataset scope — "Save Version" to persist whatever finished (each job is independently resumable) and continue in a second session; Phase 1's math shows you should have several weekly hours of slack even in a pessimistic case.
 
 ---
 # Phase 3 — Cross-Dataset Generalization Layer
@@ -861,12 +1078,30 @@ Prove the classifier isn't overfit to ASVspoof2019 by evaluating it zero-shot on
 ## Prerequisites
 
 - Phase 2 complete: trained classifier + `EmbeddingExtractor` + `VoxGuardDetector` working, and the baseline-vs-prosody-augmented decision (Phase 2, Prompt 2.6) already made
-- WaveFake and In-the-Wild preprocessed with metadata (Phase 1)
-- Phase 2's Kaggle notebook workflow still set up and working — Prompt 3.3's WavLM extraction reuses it directly, no new setup needed
+- WaveFake (subset) and In-the-Wild (subset) preprocessed with metadata (Phase 1)
+- (v4) WavLM embeddings for ASVspoof2019 AND cross-dataset embeddings (WaveFake subset, In-the-Wild subset, both backbones) were already extracted in Phase 2's consolidated Master Kaggle Session (see Phase 1's "Kaggle Free-Tier Master Strategy") — **this phase should need zero new Kaggle GPU time**. If you skipped that consolidation, open Kaggle now for just the missing pieces before continuing.
 
 ## Carrying Forward Phase 2's Prosody Decision
 
 This phase adds a second embedding backbone (WavLM), not a second prosody feature set — there's still only ONE `ProsodyFeatureExtractor` and ONE cached prosody vector per clip (Phase 2, Prompt 2.4), since prosody is a signal-processing feature independent of which transformer backbone is used. If Phase 2's comparison selected the prosody-augmented variant, this phase's ensemble should be **wav2vec2 + WavLM + prosody** (768+768+10 = 1546-dim); if Phase 2 selected the baseline, the ensemble stays **wav2vec2 + WavLM only** (1536-dim, as originally planned). Prompt 3.3 below is written to carry this forward automatically via `load_combined_features` rather than needing a separate decision here.
+
+## v4: Zero-Shot Eval Now Runs on Cached Embeddings, Not Per-File CPU Extraction
+
+v3's `zero_shot_eval` (Prompt 3.1 below) calls `detector.predict()` once per file in the WaveFake/In-the-Wild metadata — and `predict()` does its own embedding extraction internally (Phase 2, Prompt 2.7), on whatever hardware runs it. Run locally on CPU against a full, un-subsetted WaveFake set, this would cost the same order of magnitude as the "18-34 hour" full-ASVspoof CPU extraction Phase 2 already warns against — a real risk to a one-week timeline that v3 didn't flag, since nothing routed this particular call through Kaggle.
+
+v4 fixes this two ways, without touching `predict()`/`predict_waveform()`'s signatures — Phase 5 onward still calls these exactly as documented; the live streaming and demo paths are completely unaffected:
+
+1. **WaveFake is subsetted** (Phase 1, Prompt 1.2b) to a size Kaggle extracts in minutes, not hours.
+2. **Zero-shot eval gets a cache-based path** (`zero_shot_eval_from_cache`, new in Prompt 3.1 below) that loads the embeddings Phase 2's Master Kaggle Session already extracted and cached, and runs ONLY the lightweight classifier head — no re-extraction, no GPU needed, fast enough to run locally even for Prompt 3.4's four-model × three-dataset sweep. The original file-by-file `zero_shot_eval` function still exists, is still correct, and is still the right tool for a quick ad hoc check on a handful of files — it's just no longer the recommended path for full-scale runs.
+
+**A dependency this fix has that's easy to miss:** if Phase 2's comparison (Prompt 2.6) selected the **prosody-augmented** variant, the cache-based functions above need a prosody cache for WaveFake and In-the-Wild too, not just ASVspoof2019 — and nothing in v3's original Phase 2 ever extracted prosody for those two (Prompt 2.4's `extract_and_cache_prosody` was only ever pointed at ASVspoof2019's splits). Before running any cache-based cross-dataset eval under the prosody-augmented variant, run this once, locally (no Kaggle needed — same reasoning as Phase 2's original prosody step: pure CPU librosa work, and at subset scale, ~13,000 clips combined, it finishes in well under an hour):
+```
+from src.voxguard.features.compose import extract_and_cache_prosody
+from src.voxguard.utils.metadata import load_unified_metadata
+extract_and_cache_prosody(load_unified_metadata(['wavefake']), 'models/embeddings/prosody_wavefake.npy')
+extract_and_cache_prosody(load_unified_metadata(['in_the_wild']), 'models/embeddings/prosody_in_the_wild.npy')
+```
+Skip this entirely if Phase 2 selected the baseline (embedding-only) variant — `use_prosody=False` throughout and neither cache file is ever read.
 
 ---
 
@@ -888,6 +1123,20 @@ separately, and appends both rows to models/reports/cross_dataset_report.csv alo
 original ASVspoof2019 eval row from Phase 2, so the three are comparable in one table.
 ```
 
+**v4 addition to Prompt 3.1:** the four-way comparison Prompt 3.4 needs (wav2vec2-only, WavLM-only, concatenated ensemble, weighted-average ensemble) means a single-backbone cache function isn't enough — implement two functions in this file, covering all four variants between them:
+
+1. `resolve_cache_path(model_name: str, dataset: str, split: str = "eval") -> str` — a small shared helper both functions below use: if `dataset == "asvspoof2019"`, return `models/embeddings/{model_name}_{split}.npy` (Phase 2's original split-based cache, `split` defaulting to `"eval"` since that's what cross-dataset comparison needs); otherwise return `models/embeddings/{model_name}_{dataset}.npy` (Prompt 2.2's v4 dataset-based cache). This one function is what lets everything below work identically for all three datasets in Prompt 3.4's table, including the ASVspoof2019 eval column, without duplicating path logic three times.
+
+2. `zero_shot_eval_from_cache(classifier_path: str, model_names: list[str], dataset: str, use_prosody: bool = False, split: str = "eval") -> dict` — resolves a cache path per `model_names` entry via `resolve_cache_path`, and, if `use_prosody`, ALSO resolves a prosody cache path the same way — `resolve_cache_path`'s rule applies equally to prosody caches: `models/embeddings/prosody_{split}.npy` for `dataset == "asvspoof2019"` (Prompt 2.4's v4 naming convention), or `models/embeddings/prosody_{dataset}.npy` otherwise (this phase's prosody note above). Then:
+   - if `len(model_names) == 1` and `use_prosody` is False: loads directly via `load_cached_embeddings` (Phase 2, Prompt 2.2)
+   - otherwise: builds the list of resolved paths (one per backbone in `model_names`, plus the resolved prosody path if `use_prosody`) and calls `load_combined_features` (Phase 2, Prompt 2.4) to get the aligned, concatenated matrix
+   - loads the classifier via `load_classifier` (Phase 2, Prompt 2.5), runs `predict_proba`/forward pass on the whole matrix in one vectorized call, and returns the same metrics dict shape `zero_shot_eval` returns.
+   This ONE function covers three of Prompt 3.4's four variants just by varying `model_names`: `["wav2vec2"]` for (a), `["wavlm"]` for (b), `["wav2vec2", "wavlm"]` for (c) — reusing `load_combined_features` for the concatenation exactly the way Prompt 3.3's `extract_dual_embeddings` does it live, just from cache.
+
+3. `zero_shot_eval_weighted_average_from_cache(classifier_a_path: str, model_a: str, classifier_b_path: str, model_b: str, dataset: str, weight_a: float = 0.5, use_prosody: bool = False, split: str = "eval") -> dict` — covers variant (d). Loads model_a's and model_b's cached embeddings SEPARATELY (each via `resolve_cache_path` + `load_cached_embeddings`, plus each one's own prosody-augmented version via `load_combined_features` if `use_prosody` is set — do NOT concatenate the two backbones together here, each classifier scores its own feature space). Validate the two manifests share the same filepaths in the same row order (reuse `load_combined_features`'s alignment check for this even though you discard its concatenated matrix — call it once, purely to validate and to get the shared label column). Run each classifier's `predict_proba` separately, combine per-row via `weighted_average_ensemble(prob_a, prob_b, weight_a)` (Prompt 3.3), and return the same metrics dict shape.
+
+Update `scripts/run_cross_eval.py` to use `zero_shot_eval_from_cache(classifier_path, [model_name], dataset)` **by default** for its single-model comparison, falling back to the original file-by-file `zero_shot_eval` only if the relevant cache files are missing — print a clear, loud warning when that fallback triggers, so a slow multi-hour run is never a silent surprise.
+
 ### Prompt 3.2 — Second embedding extractor (WavLM)
 
 ```
@@ -899,6 +1148,10 @@ last_hidden_state-based pooling interface in transformers, so this should not re
 classes). Add a unit test confirming both model names load without error and produce
 same-shaped output for the same input audio.
 ```
+
+**v4 note on Prompt 3.2:** the unit test here is still the right thing to write, but the actual full WavLM extraction it confirms the class is ready for already happened in Phase 2's Master Kaggle Session — there's no separate WavLM Kaggle run to do in this phase under v4.
+
+**v4 fix — train the actual WavLM-only classifier (closes a gap in v3's original spec):** Prompt 3.4 below expects "(b) the WavLM-only classifier trained the same way" as (a), but nothing in v3 — not this prompt, not Prompt 3.3 (which trains the *concatenated* ensemble, not a standalone WavLM classifier) — ever actually specifies training one. Add this step here: reuse `train_logistic_regression`/`train_mlp` (Phase 2, Prompt 2.5) on the cached `wavlm_train.npy`/`wavlm_dev.npy` embeddings (concatenated with the prosody cache too, if Phase 2 selected the prosody-augmented variant — same `load_combined_features` pattern Phase 2 used, just swapping which embedding cache goes in), and save as `models/classifiers/wavlm_logreg.joblib` / `wavlm_mlp.joblib` (mirroring Phase 2's `baseline_logreg.joblib` naming, one backbone swapped for the other). Train only the ONE configuration matching whatever Phase 2's comparison actually selected — both the feature-set (baseline vs. prosody-augmented) AND the classifier type (logreg vs. MLP) — not a fresh four-way sweep; this keeps the wav2vec2-vs-WavLM comparison in Prompt 3.4 an apples-to-apples swap of backbone only, everything else held constant. This is what `zero_shot_eval_from_cache(wavlm_classifier_path, ["wavlm"], dataset)` and `zero_shot_eval_weighted_average_from_cache`'s `classifier_b_path` (Prompt 3.1, v4) actually point at.
 
 ### Prompt 3.3 — Ensembling
 
@@ -934,6 +1187,8 @@ the concatenated-feature classifier doesn't clearly outperform it — implement 
 Prompt 3.4 will decide which one you keep for the final app.
 ```
 
+**v4 note on Prompt 3.3:** step 1 above ("Extracts and caches WavLM embeddings for ASVspoof2019 train/dev... run the actual full-dataset extraction on the same Kaggle GPU notebook setup from Phase 2") was v3's instruction to do that extraction now, in this phase. Under v4, don't — that extraction already happened in Phase 2's Master Kaggle Session (see Phase 1's Master Strategy and Phase 2's Prerequisites). Replace step 1 with: load the already-cached `wav2vec2_train.npy`/`wavlm_train.npy` (and `_dev` equivalents) via `load_cached_embeddings`, and skip straight to step 2. If those files aren't present locally, that's a sign Phase 2's session didn't fully complete — go back and finish it via a short follow-up Kaggle session rather than re-triggering a fresh extraction pass here. `extract_dual_embeddings` as specified above is still correct and still what `EnsembleDetector.predict()`/`predict_waveform()` use for live single-file inference (Phase 5 onward — unchanged). For OFFLINE batch evaluation across WaveFake/In-the-Wild (Prompt 3.4), load both backbones' cached arrays directly via `load_combined_features` instead of calling `extract_dual_embeddings` in a per-file loop — numerically identical (both are just concatenation), but the cached path is what makes Prompt 3.4's four-model sweep fast rather than re-running extraction four times over.
+
 ### Prompt 3.4 — Before/after report generator
 
 ```
@@ -948,11 +1203,32 @@ the judges — make column headers and the EER/accuracy formatting clean enough 
 into a slide.
 ```
 
+**v4 note on Prompt 3.4:** build all twelve cells (4 variants × 3 datasets) from cache — nothing in this report needs live audio or a GPU. Concretely:
+- (a) wav2vec2-only: `zero_shot_eval_from_cache(wav2vec2_classifier_path, ["wav2vec2"], dataset)`
+- (b) WavLM-only: `zero_shot_eval_from_cache(wavlm_classifier_path, ["wavlm"], dataset)`
+- (c) concatenated ensemble: `zero_shot_eval_from_cache(ensemble_classifier_path, ["wav2vec2", "wavlm"], dataset)`
+- (d) weighted-average ensemble: `zero_shot_eval_weighted_average_from_cache(wav2vec2_classifier_path, "wav2vec2", wavlm_classifier_path, "wavlm", dataset)`
+
+— called once per `dataset` in `["asvspoof2019", "wavefake", "in_the_wild"]`, with `use_prosody` set consistently with whichever variant Phase 2/3 selected. `resolve_cache_path` (Prompt 3.1, v4) handles the ASVspoof2019-vs-cross-dataset naming difference transparently, so the ASVspoof2019 eval column runs through the exact same four calls as the other two columns — no separate code path needed for it. All twelve cells should complete in well under a minute total, since every embedding involved was already extracted in Phase 2's Master Kaggle Session. If generation is taking more than a few minutes, a cache file is missing and it's silently falling back to a slow per-file path — check for the warning Prompt 3.1's fallback prints rather than assuming the model itself is just slow.
+
+**v4 fix — what happens if variant (d) actually wins (closes a gap in v3's original spec):** `VoxGuardDetector` (Phase 2) and `EnsembleDetector` (Prompt 3.3, for the concatenated variant) both exist for live single-file inference, but nothing anywhere defines an equivalent for the weighted-average variant — if this table's winner turns out to be (d), Phase 5 has nothing to wrap. Decide this NOW, not when Phase 5 needs it: if (d) wins, either (i) implement a small `WeightedAverageDetector` mirroring `EnsembleDetector`'s `predict()`/`predict_waveform()` interface exactly, but running both extractors independently and combining via `weighted_average_ensemble` instead of concatenating features, or (ii) treat this table as evidence only and ship whichever of (a)/(b)/(c) is close behind for production, since a real detector class already exists for those. Document whichever choice you make in this comparison's write-up — don't leave it implicit. In practice this is a low-probability path: concatenated ensembles (c) usually match or beat weighted-averaging (d) in accuracy without the added inference-time complexity of two backbones scored separately, so if the table is close, (c) is the simpler choice already backed by a working detector class.
+
 ---
 
 ## Tests
 
 ```
+python -c "
+# v4: train the standalone WavLM-only classifier (Prompt 3.2's v4 fix) — Prompt 3.4's variant
+# (b) and the weighted-average function both need this to exist before they can run
+from src.voxguard.embeddings.cache import load_cached_embeddings
+from src.voxguard.classifier.head import train_logistic_regression
+from src.voxguard.classifier.head import save_classifier
+X_train, meta_train = load_cached_embeddings('models/embeddings/wavlm_train.npy')
+clf = train_logistic_regression(X_train, meta_train['label'])
+save_classifier(clf, 'models/classifiers/wavlm_logreg.joblib')
+print('WavLM-only classifier trained and saved')
+"
 python scripts/run_cross_eval.py
 python scripts/train_ensemble_classifier.py
 python -c "
@@ -961,6 +1237,16 @@ build_generalization_report()
 print(open('models/reports/generalization_before_after.md').read())
 "
 python -m pytest tests/ -q -k ensemble
+# v4: confirm the cache-based path is actually being used — should complete in a couple of
+# seconds, not minutes. If this hangs, a Phase 2 Kaggle extraction step was likely skipped or
+# a cache file is misnamed.
+python -c "
+import time
+from src.voxguard.classifier.cross_eval import zero_shot_eval_from_cache
+t0 = time.time()
+result = zero_shot_eval_from_cache('models/classifiers/baseline_logreg.joblib', ['wav2vec2'], 'wavefake', use_prosody=False)
+print(result, f'{time.time()-t0:.2f}s')
+"
 ```
 
 What to check in the resulting table:
@@ -972,15 +1258,21 @@ What to check in the resulting table:
 
 - [ ] Zero-shot eval implemented and run on both WaveFake and In-the-Wild
 - [ ] WavLM embedding extraction confirmed working through the same `EmbeddingExtractor` class
+- [ ] (v4) Standalone WavLM-only classifier trained and saved (`wavlm_logreg.joblib`/`wavlm_mlp.joblib`, Prompt 3.2's v4 fix) — not just the concatenated ensemble; Prompt 3.4's variant (b) and the weighted-average function both depend on this existing
 - [ ] Both ensembling strategies (concatenated-feature and weighted-average) implemented
 - [ ] Before/after generalization report generated as a clean markdown table
-- [ ] Best-performing detector variant selected and documented for use in later phases (Phase 5 onward should import whichever detector — `VoxGuardDetector` or `EnsembleDetector` — wins this comparison)
+- [ ] Best-performing detector variant selected and documented for use in later phases (Phase 5 onward should import whichever detector — `VoxGuardDetector` or `EnsembleDetector` — wins this comparison; if the weighted-average variant wins instead, see the v4 fix on Prompt 3.4 before proceeding — no detector class exists for it out of the box)
+- [ ] (v4) `zero_shot_eval_from_cache` and `zero_shot_eval_weighted_average_from_cache` implemented and confirmed fast (seconds, not minutes/hours) against the embeddings cached in Phase 2 — confirm all four Prompt 3.4 variants (wav2vec2-only, WavLM-only, concatenated, weighted-average) actually produce a result for all three datasets, not just ASVspoof2019
+- [ ] (v4) If Phase 2 selected the prosody-augmented variant: prosody features extracted locally for the WaveFake and In-the-Wild subsets (`prosody_wavefake.npy`, `prosody_in_the_wild.npy`) before running the cache-based eval — confirmed this step was skipped cleanly (not silently broken) if the baseline variant was selected instead
+- [ ] (v4) Confirmed this phase needed zero new Kaggle GPU time (or, if some was needed, documented specifically why the Phase 2 consolidation didn't fully cover it)
 
 ## Common Pitfalls
 
 - Don't cherry-pick which dataset to report if the ensemble doesn't win everywhere — report all three honestly. A judge who asks "did it help on all of them?" and gets a straight "no, here's where it didn't" answer is more convincing than a slide that quietly omits a bad result.
 - WaveFake's and In-the-Wild's audio formats/sample rates can differ from ASVspoof2019's — confirm Phase 1's preprocessing was actually applied to both before blaming the model for a generalization gap that's really a preprocessing bug.
-- You already have Phase 2's wav2vec2 embeddings downloaded locally — don't burn Kaggle GPU-hours re-extracting them. This phase's Kaggle time should go only toward the new WavLM pass.
+- You already have Phase 2's wav2vec2 AND (v4) WavLM embeddings downloaded locally for all three dataset scopes — don't burn Kaggle GPU-hours re-extracting any of them here. Under v4 this phase should need no Kaggle time at all.
+- (v4) If `run_cross_eval.py` or `build_generalization_report()` seems to hang or take unexpectedly long, it's very likely silently using the slow per-file fallback because a cache file from Phase 2's session is missing or misnamed — check the printed warning rather than assuming the model itself is just slow.
+- (v4) `load_combined_features`'s manifest-alignment check (Phase 2, Prompt 2.4) only catches a misalignment if the two caches actually have DIFFERENT filepath orderings — it can't catch a case where both caches happen to be wrong in the same way. Extract wav2vec2 and WavLM (and, if prosody-augmented, the prosody cache) for the SAME dataset scope from the SAME unmodified metadata DataFrame, in the same session, without an intervening resample/shuffle/subset step — this is exactly the "single most dangerous silent bug" already called out in Phase 2's Common Pitfalls, now applying equally to concatenating across dataset scopes here, not just across feature types there.
 
 ---
 # Phase 4 — Code-Switched Hindi/Hinglish Test & Training Track
@@ -1010,6 +1302,7 @@ The fix is standard: **split your self-built dataset into train and eval before 
 - Coqui XTTS-v2 installable (`TTS` package, already in `requirements.txt` from Phase 0) — CPML license, free for personal/research/non-commercial use; flag if this project ever goes commercial post-SIH
 - AI4Bharat Indic TTS identified as a fallback if XTTS-v2 setup stalls
 - One or more consenting speakers (yourself, and ideally 2+ teammates/friends) — **do not record or clone anyone who hasn't explicitly agreed to it**, see the consent template below
+- (v4 note: this phase's entirely-local workflow is unaffected by the v4 Kaggle consolidation described in Phase 1 — nothing below changes.)
 
 ## Local Hardware Note
 
@@ -1228,6 +1521,8 @@ Prompt 2.7 — the dimensions simply wouldn't match, and it's worth confirming t
 rather than assuming it lines up.
 ```
 
+**v4 fix — closes a gap in v3's original spec for one specific case:** the prompt above says "model_name — whichever Phase 3 crowned as best," which implicitly assumes the winner is a single backbone (wav2vec2 or WavLM alone). If Phase 3's comparison (Prompt 3.4) instead crowned the **concatenated ensemble**, a single `EmbeddingExtractor` call can't produce that feature space — extract BOTH `wav2vec2_hindi_train.npy` and `wavlm_hindi_train.npy` (two calls, same pattern as above, both still local/CPU/fast at this size) and build the Hindi train feature matrix via `load_combined_features([wav2vec2_hindi_train_path, wavlm_hindi_train_path], ...)`, adding the prosody path too if prosody-augmented — exactly mirroring how Phase 3's `train_ensemble_classifier.py` built the ASVspoof2019 side of this same feature space, just applied to the Hindi split. If Phase 3 instead crowned the **weighted-average ensemble**, there is no single combined feature space to build here — Prompt 4.8's row-wise combine needs to happen separately for each backbone (train a Hindi-augmented head for wav2vec2 alone AND one for WavLM alone, then continue applying the same weighted average at inference time), so extract and train against both backbones independently rather than picking one arbitrarily. In the common case (Phase 3 crowned a single-backbone variant), nothing changes from the original prompt above.
+
 ### Prompt 4.8 — Train both classifier variants
 
 ```
@@ -1337,7 +1632,7 @@ Manual checks:
 - [ ] Matched XTTS-v2 clones generated for every consenting speaker's real clips
 - [ ] Unified Hindi/Hinglish metadata built and merged
 - [ ] Train/eval split implemented with an explicit, documented rationale for which mode was used
-- [ ] Embeddings extracted for the Hindi train split using the same extractor config as the rest of the project
+- [ ] Embeddings extracted for the Hindi train split using the same extractor config as the rest of the project — **if Phase 3 crowned an ensemble variant (concatenated or weighted-average) rather than a single backbone, confirmed the v4 fix on Prompt 4.7 was followed (both backbones extracted for Hindi, not just one)**
 - [ ] Both Variant A (combined) and Variant B (Hindi-only) classifier heads trained
 - [ ] Cross-validation used for the small Hindi-only training set given its size
 - [ ] Full 3-way comparison (English-only baseline vs. combined vs. Hindi-only) evaluated on both the Hindi eval split and the original English eval split

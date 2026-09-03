@@ -100,7 +100,6 @@ def load_audio(
             waveform,
             orig_sr=native_sr,
             target_sr=target_sr,
-            res_type="kaiser_best",  # high-quality sinc resampler
         )
 
     # Ensure float32 (librosa.resample can return float64 in some versions)
