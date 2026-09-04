@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Mapping, Optional, Union
 
 import librosa
 import numpy as np
@@ -43,9 +43,70 @@ logger = get_logger(__name__)
 # extraction out of the inference path.
 DEFAULT_CLASSIFIER_PATH = "models/classifiers/baseline_logreg.joblib"
 
-# Probability at or above which a clip is reported as synthetic. Phase 3
-# replaces this with a tuned, per-context value via config.RISK_THRESHOLDS.
+# Probability at or above which a clip is reported as synthetic, unless a
+# caller supplies its own. Phase 3 replaces this with a tuned, per-context
+# value via config.RISK_THRESHOLDS.
+#
+# 0.5 is only correct when the deployment audio resembles ASVspoof2019's
+# studio-quality, 90%-spoof training distribution. It does NOT transfer:
+# on In-the-Wild (62.8% bonafide, real-world recordings) baseline_logreg
+# assigns genuine speech a mean synthetic-probability of 0.769 and
+# false-positives 77.2% of bonafide clips, collapsing accuracy to ~51%
+# while EER stays at 0.20 — the ranking is fine, the cutoff is not. Pass an
+# explicit ``threshold`` (see ``threshold_from_eval``) whenever the target
+# domain differs from ASVspoof2019.
 DECISION_THRESHOLD = 0.5
+
+
+def threshold_from_eval(eval_metrics: Mapping[str, object]) -> float:
+    """Pulls a calibrated decision threshold out of an evaluation result.
+
+    ``evaluate_classifier`` (Prompt 2.6) and ``zero_shot_eval`` /
+    ``zero_shot_eval_from_cache`` (Prompt 3.1) already compute
+    ``eer_threshold`` — the operating point where false-accept and
+    false-reject rates are equal on that dataset. This turns such a result
+    dict into a threshold you can hand to a detector, so a deployment whose
+    audio domain is known (live recordings, a specific channel) runs at a
+    cutoff measured on representative data instead of an inherited 0.5.
+
+    Example — calibrate for real-world audio rather than ASVspoof2019::
+
+        metrics = zero_shot_eval_from_cache(
+            "models/classifiers/baseline_logreg", ["wav2vec2"], "in_the_wild"
+        )
+        detector = VoxGuardDetector(threshold=threshold_from_eval(metrics))
+
+    Parameters
+    ----------
+    eval_metrics:
+        A metrics mapping containing an ``"eer_threshold"`` key.
+
+    Returns
+    -------
+    float
+        The EER threshold, usable as a detector's ``threshold``.
+
+    Raises
+    ------
+    KeyError
+        If *eval_metrics* has no ``"eer_threshold"``.
+    ValueError
+        If the stored threshold is NaN (which ``_metric_dict`` emits for a
+        single-class evaluation set, where no EER is defined).
+    """
+    if "eer_threshold" not in eval_metrics:
+        raise KeyError(
+            "eval_metrics has no 'eer_threshold'; expected a result dict from "
+            "evaluate_classifier or zero_shot_eval*."
+        )
+    threshold = float(eval_metrics["eer_threshold"])
+    if not np.isfinite(threshold):
+        raise ValueError(
+            "eer_threshold is not finite (the evaluation set likely had only one "
+            "class, so no equal-error operating point exists). Supply a threshold "
+            "explicitly instead."
+        )
+    return threshold
 
 
 class VoxGuardDetector:
@@ -75,6 +136,13 @@ class VoxGuardDetector:
         metadata sidecar: prosody is enabled when the model's
         ``input_dim`` exceeds the backbone's embedding width. Pass
         ``True``/``False`` only to override that detection.
+    threshold:
+        Default probability at or above which a clip is labelled
+        ``"synthetic"``. Defaults to ``DECISION_THRESHOLD`` (0.5), which is
+        only well calibrated for ASVspoof2019-like audio; use
+        :func:`threshold_from_eval` to set an operating point measured on
+        the deployment's own domain. Individual calls can override this per
+        prediction.
 
     Raises
     ------
@@ -88,7 +156,9 @@ class VoxGuardDetector:
         embedding_model_name: Optional[str] = None,
         classifier_path: Union[str, Path] = DEFAULT_CLASSIFIER_PATH,
         use_prosody: Optional[bool] = None,
+        threshold: float = DECISION_THRESHOLD,
     ) -> None:
+        self.threshold = float(threshold)
         path = Path(classifier_path)
         if not path.is_absolute():
             path = config.BASE_DIR / path
@@ -181,7 +251,9 @@ class VoxGuardDetector:
             return float(self.model.predict_proba(features)[0])
         raise TypeError(f"Unsupported classifier type: {type(self.model)!r}")
 
-    def predict(self, audio_path: str) -> Dict[str, object]:
+    def predict(
+        self, audio_path: str, threshold: Optional[float] = None
+    ) -> Dict[str, object]:
         """Predicts whether the audio file at *audio_path* is synthetic.
 
         Stable interface — later phases depend on this signature.
@@ -192,6 +264,10 @@ class VoxGuardDetector:
             Path to an audio file readable by ``audio_io.load_audio``
             (WAV, FLAC, OGG, ...). Resampled to ``config.SAMPLE_RATE`` and
             downmixed to mono automatically.
+        threshold:
+            Optional per-call override of the detector's decision
+            threshold. ``None`` (the default) uses ``self.threshold``, so
+            existing callers are unaffected.
 
         Returns
         -------
@@ -200,9 +276,11 @@ class VoxGuardDetector:
             where the probability is in ``[0, 1]``.
         """
         waveform, sr = load_audio(audio_path, target_sr=config.SAMPLE_RATE)
-        return self.predict_waveform(waveform, sr)
+        return self.predict_waveform(waveform, sr, threshold=threshold)
 
-    def predict_waveform(self, waveform: np.ndarray, sr: int) -> Dict[str, object]:
+    def predict_waveform(
+        self, waveform: np.ndarray, sr: int, threshold: Optional[float] = None
+    ) -> Dict[str, object]:
         """Predicts whether an in-memory waveform is synthetic.
 
         Identical logic to :meth:`predict` without the file read. **Performs
@@ -219,6 +297,10 @@ class VoxGuardDetector:
             Sample rate of *waveform* in Hz. Resampled to
             ``config.SAMPLE_RATE`` if it differs, so that prosody features
             are computed at the same rate they were trained on.
+        threshold:
+            Optional per-call override of the detector's decision
+            threshold. ``None`` (the default) uses ``self.threshold``, so
+            existing callers are unaffected.
 
         Returns
         -------
@@ -235,9 +317,10 @@ class VoxGuardDetector:
             sr = config.SAMPLE_RATE
 
         probability_synthetic = self._score(self._build_features(waveform, sr))
+        cutoff = self.threshold if threshold is None else float(threshold)
 
         return {
-            "label": "synthetic" if probability_synthetic >= DECISION_THRESHOLD else "real",
+            "label": "synthetic" if probability_synthetic >= cutoff else "real",
             "probability_synthetic": probability_synthetic,
         }
 
@@ -245,7 +328,8 @@ class VoxGuardDetector:
         return (
             f"VoxGuardDetector(backbone={self.extractor.model_name!r}, "
             f"classifier={self.classifier_path.name!r}, "
-            f"input_dim={self.input_dim}, use_prosody={self.use_prosody})"
+            f"input_dim={self.input_dim}, use_prosody={self.use_prosody}, "
+            f"threshold={self.threshold:.4f})"
         )
 
 
