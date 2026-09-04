@@ -11,6 +11,21 @@ scripts/train_classifier.py, evaluates all four trained classifiers
 (baseline_logreg, baseline_mlp, prosody_logreg, prosody_mlp), and writes a
 comparison table to models/reports/asvspoof2019_eval_report.csv with
 columns [model, feature_set, accuracy, roc_auc, eer].
+
+Outcome of this comparison (2026-09-04, on the re-extracted + standardized
+features) — full rationale in models/reports/decision_notes.md:
+
+    CHOSEN MODEL: models/classifiers/baseline_logreg.joblib
+    feature_set = baseline (wav2vec2 embeddings only, 768-dim)
+    EER = 0.1090, ROC-AUC = 0.9546
+
+    Lowest EER of the four candidates. Prosody augmentation is a wash on
+    logreg (+0.0006 EER) and only helps the MLP (-0.0133), which is the
+    weaker head either way — so the 768-dim baseline wins on accuracy AND
+    keeps librosa prosody extraction out of the inference path.
+
+This is what Prompt 2.7's VoxGuardDetector should load. Note load_classifier
+returns (model, scaler); the scaler transform is mandatory before scoring.
 """
 
 from __future__ import annotations
