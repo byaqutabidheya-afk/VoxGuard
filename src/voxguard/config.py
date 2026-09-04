@@ -48,9 +48,10 @@ SAMPLE_RATE: int = 16_000
 # =============================================================================
 
 # Phase 1 — embedding backbone
-# Hugging Face model-hub identifier, e.g. "facebook/wav2vec2-base" or
-# "microsoft/wavlm-base-plus".  Left unset until Phase 1 selects the backbone.
-EMBEDDING_MODEL_NAME: str | None = None  # TODO Phase 1
+# Hugging Face model-hub identifier for the SSL speech embedding backbone.
+# "facebook/wav2vec2-base" is the project default. "microsoft/wavlm-base-plus"
+# is the alternative used later in Phase 3.
+EMBEDDING_MODEL_NAME: str = "facebook/wav2vec2-base"
 
 # Phase 3 — classification thresholds
 # Dict mapping label → probability threshold, e.g. {"synthetic": 0.5}.
