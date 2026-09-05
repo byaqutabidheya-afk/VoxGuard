@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from voxguard import config
+from voxguard.utils.audio_io import get_duration_seconds
 from voxguard.utils.logging_utils import get_logger
 
 logger = get_logger("xtts_clone")
@@ -115,6 +116,32 @@ def get_xtts_model(
     return _XTTS_MODEL
 
 
+# Rough expected audio duration per input character, used only to catch
+# grossly-wrong generations (truncation, rambling/hallucination) - not a
+# precise speech-rate model.
+EXPECTED_SECONDS_PER_CHAR_LOW = 0.06
+EXPECTED_SECONDS_PER_CHAR_HIGH = 0.15
+
+# A generation is "suspicious" outside ~50%-200% of the expected range,
+# which is wide enough to tolerate normal speech-rate and punctuation
+# variation while still catching truncated output (way too short) and the
+# rambling/hallucinating failure mode (way too long).
+SUSPICIOUS_DURATION_LOW_FACTOR = 0.5
+SUSPICIOUS_DURATION_HIGH_FACTOR = 2.0
+
+
+def _expected_duration_range(text: str) -> tuple[float, float]:
+    """Returns the (low, high) duration in seconds a generation for *text*
+    should fall within before it's flagged as suspicious and retried."""
+    n_chars = len(text)
+    expected_low = n_chars * EXPECTED_SECONDS_PER_CHAR_LOW
+    expected_high = n_chars * EXPECTED_SECONDS_PER_CHAR_HIGH
+    return (
+        expected_low * SUSPICIOUS_DURATION_LOW_FACTOR,
+        expected_high * SUSPICIOUS_DURATION_HIGH_FACTOR,
+    )
+
+
 def clone_voice(
     reference_audio_path: Union[str, Path],
     text: str,
@@ -122,6 +149,10 @@ def clone_voice(
     output_path: Optional[Union[str, Path]] = None,
     use_gpu: bool = False,
     gpu: Optional[bool] = None,
+    temperature: float = 0.3,
+    repetition_penalty: float = 10.0,
+    length_penalty: float = 1.0,
+    max_retries: int = 3,
 ) -> str:
     """
     Synthesizes speech in the target speaker's voice using XTTS-v2 one-shot voice cloning.
@@ -140,6 +171,26 @@ def clone_voice(
         Whether to run synthesis on GPU (default: False, CPU mode).
     gpu:
         Legacy alias for use_gpu.
+    temperature:
+        XTTS-v2 sampling temperature (default 0.3, down from XTTS-v2's own
+        default of ~0.65-0.75). Lower temperature trades away some
+        naturalness/expressiveness for much better run-to-run consistency -
+        empirically, the default temperature produced unintelligible output
+        on roughly 2 of every 3 identical attempts. That tradeoff is worth
+        it here: this function is generating a labeled dataset, where a
+        consistent, usable clip matters far more than a single expressive
+        demo take.
+    repetition_penalty:
+        Penalty discouraging the model from repeating itself (default 10.0,
+        XTTS-v2's own default).
+    length_penalty:
+        Penalty applied to output length during generation (default 1.0,
+        XTTS-v2's own default).
+    max_retries:
+        Maximum synthesis attempts if the output duration looks suspicious
+        relative to the input text length (see `_expected_duration_range`).
+        After the last attempt, that attempt's output is accepted regardless,
+        with a logged warning, rather than failing the whole call.
 
     Returns
     -------
@@ -168,17 +219,54 @@ def clone_voice(
         f"Cloning voice from '{ref_path.name}' for text ({len(text)} chars) -> '{out_path.name}'"
     )
 
-    try:
-        tts.tts_to_file(
-            text=text,
-            speaker_wav=str(ref_path),
-            language=language,
-            file_path=str(out_path),
-            split_sentences=True,
-        )
-    except Exception as exc:
-        logger.error(f"XTTS-v2 synthesis failed for '{ref_path.name}': {exc}")
-        raise RuntimeError(f"XTTS-v2 synthesis error: {exc}") from exc
+    min_duration, max_duration = _expected_duration_range(text)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            tts.tts_to_file(
+                text=text,
+                speaker_wav=str(ref_path),
+                language=language,
+                file_path=str(out_path),
+                split_sentences=True,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+            )
+        except Exception as exc:
+            logger.error(f"XTTS-v2 synthesis failed for '{ref_path.name}': {exc}")
+            raise RuntimeError(f"XTTS-v2 synthesis error: {exc}") from exc
+
+        duration = get_duration_seconds(out_path)
+
+        if min_duration <= duration <= max_duration:
+            break
+
+        if attempt < max_retries:
+            logger.warning(
+                "Attempt %d/%d for '%s' produced a suspicious duration (%.2fs, expected "
+                "%.2f-%.2fs for %d chars) - likely truncated or rambling output; retrying.",
+                attempt,
+                max_retries,
+                ref_path.name,
+                duration,
+                min_duration,
+                max_duration,
+                len(text),
+            )
+        else:
+            logger.warning(
+                "Attempt %d/%d for '%s' still produced a suspicious duration (%.2fs, "
+                "expected %.2f-%.2fs for %d chars) - accepting it anyway after exhausting "
+                "max_retries.",
+                attempt,
+                max_retries,
+                ref_path.name,
+                duration,
+                min_duration,
+                max_duration,
+                len(text),
+            )
 
     return str(out_path)
 
