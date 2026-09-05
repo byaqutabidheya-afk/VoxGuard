@@ -107,8 +107,8 @@ def test_clone_voice_mocked_execution(tmp_path: Path) -> None:
 
     mock_tts = MagicMock()
 
-    def fake_tts_to_file(text, speaker_wav, language, file_path, split_sentences=True):
-        # Create output file
+    def fake_tts_to_file(text, speaker_wav, language, file_path, **kwargs):
+        # Create output file (2.0s duration)
         sf.write(file_path, np.zeros(16000 * 2, dtype=np.float32), 16000)
 
     mock_tts.tts_to_file.side_effect = fake_tts_to_file
@@ -125,13 +125,13 @@ def test_clone_voice_mocked_execution(tmp_path: Path) -> None:
         assert res_path == str(out_audio.resolve())
         assert out_audio.exists()
         mock_get_model.assert_called_once_with(use_gpu=False)
-        mock_tts.tts_to_file.assert_called_once_with(
-            text="Testing voice cloning",
-            speaker_wav=str(ref_audio.resolve()),
-            language="hi",
-            file_path=str(out_audio.resolve()),
-            split_sentences=True,
-        )
+        assert mock_tts.tts_to_file.called
+        call_kwargs = mock_tts.tts_to_file.call_args[1]
+        assert call_kwargs["text"] == "Testing voice cloning"
+        assert call_kwargs["speaker_wav"] == str(ref_audio.resolve())
+        assert call_kwargs["language"] == "hi"
+        assert call_kwargs["file_path"] == str(out_audio.resolve())
+        assert call_kwargs["split_sentences"] is True
 
 
 def test_generate_hindi_clones_batch(

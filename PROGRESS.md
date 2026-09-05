@@ -127,6 +127,57 @@ Last updated: 2026-09-04
   or at minimum use a threshold derived from a dataset not used to select it.
   Full writeup appended to `models/reports/generalization_before_after.md`.
 
+## Phase 4 — Hindi/Hinglish track: DONE (with a known, documented confound — read before trusting the numbers)
+- 3 speakers (byaquta, mahato, soumya), 25 sentences each, 75 real clips + 75 matched XTTS-v2
+  synthetic clips = 150 total. Consent for recording AND cloning obtained in writing from all
+  three before any clone was generated.
+- Two real bugs found and fixed during synthesis (Prompt 4.3): (1) `num2words` has no Hindi
+  support, so any sentence with a bare digit crashes XTTS-v2's Hindi text normalization —
+  worked around by spelling numbers out ("ten AM" not "10 AM"); (2) XTTS-v2 generation is
+  stochastic and default settings produced frequently unintelligible output — fixed with
+  temperature=0.3, repetition_penalty=10.0, split_sentences=True, and a retry-on-validation-
+  failure loop (max_retries=3). Final quality: pure-Hindi sentences broadly intelligible,
+  code-switched sentences ~60% intelligible. No clips were cherry-picked.
+- Train/eval split (Prompt 4.6): `speaker_holdout` mode, `holdout_speaker='soumya'`. Train =
+  byaquta + mahato (100 clips). Eval = soumya (50 clips), fully unseen. This holdout speaker
+  MUST stay identical across Prompts 4.7/4.8/4.10 — already was, for this run.
+- Phase 3 crowned the WEIGHTED-AVERAGE ensemble, not a single backbone — so Prompts 4.7/4.8/4.10
+  were all adapted from their v3/base-spec form to train and evaluate wav2vec2 and WavLM
+  independently (no shared feature space to build), matching WeightedAverageDetector's own
+  architecture. No prosody involved anywhere (Phase 2 selected the baseline, non-prosody variant).
+- Full comparison report: `models/reports/hindi_training_comparison.md`. Headline numbers:
+  zero-shot production detector (weighted-average, no Hindi training) scored 50.0% acc / 20.0%
+  EER on held-out Hindi; Hindi-combined production detector scored 96.0% acc / 2.0% EER, with
+  no meaningful English regression (91.5% vs 91.7% ASVspoof2019 accuracy). Hindi-only training
+  (no English data) caused catastrophic English collapse (61.3% ASVspoof accuracy, down from
+  91.5%), confirming English data acts as a regularizer.
+
+  **CRITICAL CAVEAT — read before citing any Hindi-track accuracy/EER number:** post-hoc
+  confound analysis found that clip DURATION and RMS ENERGY ALONE (no embeddings, no acoustic
+  content, just two scalar values) predict real-vs-synthetic label with 83.3% cross-validated
+  accuracy on this dataset. Real clips average ~4.95s; synthetic clips average ~7.44s — a large,
+  near-non-overlapping gap, most likely because XTTS-v2's `split_sentences=True` + retry-on-
+  validation-failure pipeline tends to produce longer output than natural read-aloud speech.
+  This means a substantial, unquantified portion of the reported 96-100% Hindi-eval accuracies
+  very likely reflects this duration/energy confound rather than purely embedding-based
+  synthetic-speech detection. The confound affects ALL speakers equally (it's a pipeline
+  artifact, not a per-speaker one), so the speaker-holdout eval design does NOT rule it out —
+  holding out a speaker only rules out speaker-identity shortcuts, not a pipeline-level
+  real-vs-synthetic confound present in every pair regardless of who's speaking.
+  Decision: documented as an explicit known limitation in the dataset card (Path A) rather than
+  fixed now (Path B would be duration-matching real/synthetic clips and re-running Prompts
+  4.7/4.8/4.10 — a real chunk of work, deferred given 7 phases still remain).
+  **Anyone using these classifiers or numbers downstream (demo, slides, further phases) should
+  cite them with this caveat attached, not as a clean result.**
+- **Phase 4 fully closed out:** all 19 Hindi-related tests pass. `WeightedAverageDetector`
+  verified working when pointed at the Hindi-combined classifiers directly:
+  `WeightedAverageDetector(wav2vec2_classifier_path='models/classifiers/wav2vec2_hindi_combined_logreg.joblib',
+  wavlm_classifier_path='models/classifiers/wavlm_hindi_combined_logreg.joblib')`.
+  **Phase 5 onward MUST wrap this exact configuration** (the Hindi-combined pair), not the
+  original English-only baseline_logreg/wavlm_logreg pair used in Phases 2-3 — this is the
+  "Variant A" the guide's Definition of Done requires downstream phases to use, adapted for the
+  weighted-average-ensemble case. No English regression confirmed (91.5% vs 91.7% baseline).
+
 ## Not started
 - Phase 4 (Hindi/Hinglish track)
 - Phase 5 (real-time streaming + challenge-response)
