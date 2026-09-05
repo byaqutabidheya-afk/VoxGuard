@@ -174,6 +174,7 @@ def clone_voice(
             speaker_wav=str(ref_path),
             language=language,
             file_path=str(out_path),
+            split_sentences=True,
         )
     except Exception as exc:
         logger.error(f"XTTS-v2 synthesis failed for '{ref_path.name}': {exc}")

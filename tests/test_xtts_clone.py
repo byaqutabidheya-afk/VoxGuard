@@ -107,7 +107,7 @@ def test_clone_voice_mocked_execution(tmp_path: Path) -> None:
 
     mock_tts = MagicMock()
 
-    def fake_tts_to_file(text, speaker_wav, language, file_path):
+    def fake_tts_to_file(text, speaker_wav, language, file_path, split_sentences=True):
         # Create output file
         sf.write(file_path, np.zeros(16000 * 2, dtype=np.float32), 16000)
 
@@ -130,6 +130,7 @@ def test_clone_voice_mocked_execution(tmp_path: Path) -> None:
             speaker_wav=str(ref_audio.resolve()),
             language="hi",
             file_path=str(out_audio.resolve()),
+            split_sentences=True,
         )
 
 
