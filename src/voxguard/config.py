@@ -54,9 +54,26 @@ SAMPLE_RATE: int = 16_000
 EMBEDDING_MODEL_NAME: str = "facebook/wav2vec2-base"
 
 # Phase 3 — classification thresholds
-# Dict mapping label → probability threshold, e.g. {"synthetic": 0.5}.
-# Tuned on the validation set in Phase 3; do not invent a value here.
-RISK_THRESHOLDS: dict | None = None  # TODO Phase 3
+# Calibrated via scripts/calibrate_thresholds.py on ASVspoof2019 dev using
+# the production WeightedAverageDetector
+# (wav2vec2_hindi_combined_logreg + wavlm_hindi_combined_logreg, weight_a=0.5).
+#
+# Candidate tradeoffs from that calibration sweep:
+# - 0.20/0.60 -> FNR_low=0.10%, FPR_flag=23.19%, FPR_high=3.92%, TPR_high=98.65%
+# - 0.30/0.70 -> FNR_low=0.14%, FPR_flag=19.27%, FPR_high=3.02%, TPR_high=98.08%
+# - 0.50/0.80 -> FNR_low=0.46%, FPR_flag= 7.69%, FPR_high=2.16%, TPR_high=97.45%
+#
+# We deliberately keep 0.50/0.80 for demo behavior: it greatly reduces false
+# alarms on genuine speech (FPR_flag 7.69% vs 23.19% at 0.20/0.60) while still
+# keeping synthetic misses very low (FNR_low 0.46%). A production deployment
+# might reasonably choose a tighter setting to prioritize catch rate further.
+RISK_THRESHOLDS: dict = {
+    # probability_synthetic < low_max              → risk level "low"
+    # low_max ≤ probability_synthetic ≤ medium_max → risk level "medium"
+    # probability_synthetic > medium_max           → risk level "high"
+    "low_max": 0.5,
+    "medium_max": 0.8,
+}
 
 # Phase 4 — streaming / real-time inference
 # Duration of each audio chunk fed to the model (seconds).
