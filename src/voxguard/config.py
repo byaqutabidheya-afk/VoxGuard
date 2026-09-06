@@ -27,10 +27,10 @@ from pathlib import Path
 # parents[2] → <repo root>
 BASE_DIR: Path = Path(__file__).resolve().parents[2]
 
-DATA_RAW_DIR: Path       = BASE_DIR / "data" / "raw"
+DATA_RAW_DIR: Path = BASE_DIR / "data" / "raw"
 DATA_PROCESSED_DIR: Path = BASE_DIR / "data" / "processed"
-DATA_METADATA_DIR: Path  = BASE_DIR / "data" / "metadata"
-MODELS_DIR: Path         = BASE_DIR / "models"
+DATA_METADATA_DIR: Path = BASE_DIR / "data" / "metadata"
+MODELS_DIR: Path = BASE_DIR / "models"
 
 # =============================================================================
 # 2. Audio constants
@@ -60,16 +60,19 @@ RISK_THRESHOLDS: dict | None = None  # TODO Phase 3
 
 # Phase 4 — streaming / real-time inference
 # Duration of each audio chunk fed to the model (seconds).
-STREAM_CHUNK_SECONDS: float | None = None  # TODO Phase 4
+STREAM_CHUNK_SECONDS: float | None = 1.5
 
 # Overlap between consecutive chunks to avoid boundary artefacts (seconds).
-STREAM_OVERLAP_SECONDS: float | None = None  # TODO Phase 4
+STREAM_OVERLAP_SECONDS: float | None = 0.5
+
+# Decision threshold used by the streaming session wrapper.
+STREAM_FLAG_THRESHOLD: float | None = 0.6
 
 # Phase 9 (Prompt 9.5) — multimodal risk fusion context tables
 # Maps a call/transaction context string to a risk-weight multiplier,
 # e.g. {"banking": 1.5, "general": 1.0}.  Filled in during Phase 9 Prompt 9.5
 # once the fusion feature set is finalised.
-TRANSACTION_CONTEXTS: dict | None = None           # TODO Phase 9 Prompt 9.5
+TRANSACTION_CONTEXTS: dict | None = None  # TODO Phase 9 Prompt 9.5
 
 # Maps a contact-familiarity label to a risk-weight multiplier,
 # e.g. {"unknown": 1.3, "known": 0.8}.  Same phase as above.
@@ -78,6 +81,7 @@ CONTACT_FAMILIARITY_MULTIPLIERS: dict | None = None  # TODO Phase 9 Prompt 9.5
 # =============================================================================
 # 4. Runtime helpers
 # =============================================================================
+
 
 def get_device() -> str:
     """Return the best available compute device as a torch-compatible string.
@@ -93,6 +97,7 @@ def get_device() -> str:
     """
     try:
         import torch  # local import so config.py stays importable without torch
+
         return "cuda" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"

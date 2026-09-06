@@ -179,6 +179,12 @@ class EnsembleDetector:
         *threshold* optionally overrides ``self.threshold`` for this call;
         ``None`` (the default) preserves the detector's configured cutoff.
         """
+        if VoxGuardDetector._rms_energy(waveform) < 0.01:
+            return {
+                "label": "inconclusive",
+                "probability_synthetic": None,
+            }
+
         features = self._build_features(waveform, sr)
         probability_synthetic = self._score(features)
         cutoff = self.threshold if threshold is None else float(threshold)
@@ -254,9 +260,16 @@ class WeightedAverageDetector:
         threshold: Optional[float],
     ) -> Dict[str, object]:
         """Averages the two sub-scores and applies the decision threshold."""
+        prob_a = prediction_a.get("probability_synthetic")
+        prob_b = prediction_b.get("probability_synthetic")
+        if prob_a is None or prob_b is None:
+            return {
+                "label": "inconclusive",
+                "probability_synthetic": None,
+            }
         probability_synthetic = weighted_average_ensemble(
-            float(prediction_a["probability_synthetic"]),
-            float(prediction_b["probability_synthetic"]),
+            float(prob_a),
+            float(prob_b),
             weight_a=self.weight_a,
         )
         cutoff = self.threshold if threshold is None else float(threshold)

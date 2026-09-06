@@ -221,6 +221,14 @@ class VoxGuardDetector:
         with open(meta_path) as f:
             return int(json.load(f)["input_dim"])
 
+    @staticmethod
+    def _rms_energy(chunk: np.ndarray) -> float:
+        """Computes chunk RMS energy using a float64 accumulator."""
+        chunk = np.asarray(chunk)
+        if chunk.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+
     def _build_features(self, waveform: np.ndarray, sr: int) -> np.ndarray:
         """Builds the model's input vector from an in-memory waveform.
 
@@ -305,10 +313,18 @@ class VoxGuardDetector:
         Returns
         -------
         dict
-            ``{"label": "real"|"synthetic", "probability_synthetic": float}``
-            where the probability is in ``[0, 1]``.
+            ``{"label": "real"|"synthetic"|"inconclusive", "probability_synthetic": float|None}``
+            where ``"inconclusive"`` is returned for near-silent input whose
+            RMS energy falls below the classifier's unsupported non-speech
+            regime.
         """
         waveform = np.asarray(waveform, dtype=np.float32)
+
+        if self._rms_energy(waveform) < 0.01:
+            return {
+                "label": "inconclusive",
+                "probability_synthetic": None,
+            }
 
         if sr != config.SAMPLE_RATE:
             waveform = librosa.resample(

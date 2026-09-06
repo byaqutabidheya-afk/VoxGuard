@@ -58,9 +58,11 @@ shap>=0.45,<1                  # SHAP values for acoustic feature attribution
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────
 gradio>=4.37,<5                # interactive web UI for demo and evaluation
+starlette<1.0                  # Gradio 4.x Jinja2Templates compatibility
+pydantic<2.10                  # Gradio 4.x schema compatibility (breaks on 2.10+)
 
 # ── FastAPI REST server (Phase 11) ────────────────────────────────────────
-fastapi>=0.111,<1
+fastapi>=0.111,<0.115
 uvicorn[standard]>=0.30,<1
 python-multipart>=0.0.9,<1     # required by FastAPI for multipart/form-data file uploads
 

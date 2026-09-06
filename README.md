@@ -38,13 +38,34 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Running
+## Running Locally
 
 ```bash
-# Gradio UI
-python app/app.py
+# Activate the virtual environment first
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
 
-# FastAPI REST server
+# Start the Gradio UI
+python app/app.py
+```
+
+The Gradio UI will be available at **http://127.0.0.1:7860**. Microphone access in the browser requires the page to be served over `localhost` or HTTPS — Gradio's default local server satisfies this requirement automatically.
+
+### Known-working dependency versions (Gradio app)
+
+The Gradio UI requires these exact version pins (already specified in `requirements.txt`):
+
+- `pydantic<2.10`
+- `starlette<1.0`
+- `fastapi<0.115`
+
+Newer versions of these libraries have documented incompatibilities with Gradio 4.x that produce confusing, unrelated-looking errors on startup — a Jinja2 `TemplateResponse` crash and a separate `TypeError: argument of type 'bool' is not iterable` schema-processing crash — so if you update dependencies later and the app breaks mysteriously, check these three first.
+
+## Running the FastAPI Backend
+
+```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 

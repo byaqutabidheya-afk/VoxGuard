@@ -1,8 +1,10 @@
 # VoxGuard Build Progress
 
-Last updated: 2026-09-04
+Last updated: 2026-09-06
 
-## Status: Phase 2 complete, Phase 3 starting (Prompt 3.1 built, about to run)
+## Status: Phases 1-6 complete. Phase 7 (risk meter) not yet started. See ISSUES.md for
+three known, documented-not-fixed issues before trusting any Hindi-track accuracy number in
+isolation.
 
 ---
 
@@ -178,7 +180,77 @@ Last updated: 2026-09-04
   "Variant A" the guide's Definition of Done requires downstream phases to use, adapted for the
   weighted-average-ensemble case. No English regression confirmed (91.5% vs 91.7% baseline).
 
-## Not started
+## Phase 6 — Gradio demo app: DONE
+- `app/app.py` built across all six prompts: two-tab Blocks app (Live Mic, Upload File),
+  privacy-preserving session logging, README documentation, basic layout polish.
+- Wraps the Phase 4 production configuration (`WeightedAverageDetector` with
+  `wav2vec2_hindi_combined_logreg.joblib` + `wavlm_hindi_combined_logreg.joblib`), consistent
+  with Phase 5's streaming default.
+
+- **Three real, durable dependency-version bugs found and fixed** (not workarounds — pinned in
+  `requirements.txt`, documented in `README.md`'s "Running Locally" section so they don't get
+  silently reintroduced by a future `pip install --upgrade`):
+  1. Gradio 4.44.1 calling Starlette's `Jinja2Templates.TemplateResponse` with an old argument
+     order that Starlette 1.0+ removed support for → fixed by pinning `starlette<1.0` and
+     `fastapi<0.115` (fastapi pulls in starlette transitively; pinning starlette alone wasn't
+     sufficient, fastapi had to be pinned too). A runtime monkey-patch was tried first and
+     worked, but was replaced with the version pin as the durable fix — confirmed the app
+     launches clean with the patch fully removed.
+  2. `TypeError: argument of type 'bool' is not iterable` in `gradio_client/utils.py`'s
+     `get_type()` — Pydantic 2.10+ changed how it emits `additionalProperties` in JSON schemas
+     (object → bare bool), which Gradio 4.x's schema-to-Python-type conversion doesn't handle.
+     Fixed by pinning `pydantic<2.10`. This crash was ALSO the hidden cause of a separate-looking
+     `ValueError: When localhost is not accessible...` error — Gradio's own startup reachability
+     self-check hit this same crashing code path, and Gradio misinterpreted the resulting request
+     failure as "can't reach localhost." Both errors resolved together from the one pydantic fix.
+  3. Mojibake corruption (`â€”` instead of `—`) in the app title/header from a UTF-8-as-Latin-1
+     encoding mismatch — fixed, file re-saved as explicit UTF-8.
+
+- **A fourth, separate bug found and fixed during Phase 6 (not a dependency issue — a real logic
+  bug):** `StreamingSession` never propagated the actual incoming sample rate down to
+  `StreamingBuffer`, which defaulted to assuming 16000 Hz. Gradio's browser microphone delivers
+  48000 Hz. This meant every "1.5 second" streaming window during live mic use actually contained
+  only 0.5 real seconds of audio (further truncated after resampling), feeding the classifier
+  choppy, mid-word fragments — a highly plausible explanation for erratic live-mic behavior,
+  including false positives on the user's own real voice. **Fixed:** `StreamingSession` now
+  dynamically captures the real sample rate on the first `push_audio()` call and (re)builds its
+  buffer to match, with a mid-session rate-mismatch guard (raises clearly if `sr` changes
+  unexpectedly). Verified via 82/82 passing tests and matched 16kHz-vs-48kHz-simulated-stream
+  behavior.
+  - **Important:** this fix did NOT fully resolve real-voice false positives on its own — e.g.
+    `byaquta_neutral_01` (real) still flags in streaming post-fix (score ~0.44-0.46). That
+    residual behavior is Issue #2/#3 (see ISSUES.md), not this bug — this fix corrected a real,
+    separate plumbing defect; it's a necessary fix but not sufficient to fully solve streaming
+    reliability.
+
+- **Live demo script identified and verified.** Following the sample-rate fix, benchmarked the
+  actual planned demo script content (not generic test sentences) through the real
+  `StreamingSession` path and found **5 verified real/synthetic pairs, spanning 3 speakers
+  (including held-out speaker soumya) and 4 content categories** (casual, tech, two scam-call
+  styles) that behave reliably: real clips score 0.00-0.35 (well under the 0.6 threshold,
+  correctly unflagged) and synthetic clones flag confidently within exactly 2.0 seconds. Full
+  details and the 5 script/speaker pairs in `PHASE5_STREAMING_NOTES.md`.
+  **ACTION FOR PHASE 11: the live demo script/speaker MUST be drawn from this verified set —
+  do not assume untested content or speakers will behave the same way.**
+
+- Upload File tab shows BOTH whole-clip and streaming-simulation verdicts side by side for any
+  uploaded file — this makes Issue #2 (whole-clip vs. streaming disagreement) directly visible
+  and explainable in the UI itself, which is a genuine asset if a judge asks a sharp question
+  about it, not something hidden.
+
+- `SessionLogger` (`src/voxguard/privacy/session_log.py`) implemented and verified: logs only
+  timestamp/event_type/risk_band/probability_synthetic/flagged/category-labels — structurally
+  cannot log raw audio, transcript text, or speaker identity (not in the function signature at
+  all). `data/logs/` gitignored. 30-day purge implemented and tested. Wired into both Live Mic
+  and Upload File handlers, plus a startup purge call in `app.py`.
+
+- **New consolidated tracking file created: `ISSUES.md`** — lists all THREE still-unresolved,
+  documented-not-fixed issues (duration confound, chunk-level reliability gap, WavLM Hindi-head
+  disagreement) in one place, cross-referenced to `VoxGuard_Remediation_Guide.md` (a full
+  phased-prompt remediation plan for all three, written in BuildGuidev4's own format, for use
+  only if real time remains after core phases + demo rehearsal).
+
+## Phase 7+ — Not started
 - Phase 4 (Hindi/Hinglish track)
 - Phase 5 (real-time streaming + challenge-response)
 - Speaker voiceprint verification, multimodal call-context fusion, explainability overlay,
