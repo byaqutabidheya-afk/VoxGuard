@@ -85,15 +85,38 @@ STREAM_OVERLAP_SECONDS: float | None = 0.5
 # Decision threshold used by the streaming session wrapper.
 STREAM_FLAG_THRESHOLD: float | None = 0.6
 
-# Phase 9 (Prompt 9.5) — multimodal risk fusion context tables
-# Maps a call/transaction context string to a risk-weight multiplier,
-# e.g. {"banking": 1.5, "general": 1.0}.  Filled in during Phase 9 Prompt 9.5
-# once the fusion feature set is finalised.
-TRANSACTION_CONTEXTS: dict | None = None  # TODO Phase 9 Prompt 9.5
+# Phase 7 / Prompt 9.4 — Multimodal Risk Fusion Context Tables
+#
+# Starting defaults representing the relative stakes named in the problem
+# statement's examples ("high-value transaction calls, privileged access approvals").
+# Like RISK_THRESHOLDS, these values represent starting heuristic defaults
+# requiring empirical calibration against production fraud telemetry rather
+# than immutable constants.
+TRANSACTION_CONTEXTS: dict[str, float] = {
+    "general_conversation": 1.0,
+    "otp_request": 1.3,
+    "fund_transfer": 1.5,
+    "confidential_info_request": 1.4,
+}
 
-# Maps a contact-familiarity label to a risk-weight multiplier,
-# e.g. {"unknown": 1.3, "known": 0.8}.  Same phase as above.
-CONTACT_FAMILIARITY_MULTIPLIERS: dict | None = None  # TODO Phase 9 Prompt 9.5
+# Contact Familiarity Multipliers:
+# - "known_match" (0.9): A verified match against an enrolled voiceprint
+#   mildly LOWERS risk (0.9) — mildly, not dramatically, because a good clone
+#   of a known contact's voice would also pass this check, so it's corroborating
+#   evidence, not proof.
+# - "known_mismatch" (1.3): A verified MISMATCH meaningfully raises risk (1.3) —
+#   someone claiming to be a known contact whose voice doesn't match is a strong
+#   signal on its own.
+# - "no_enrollment_data" (1.0): The absence of any enrollment data stays
+#   perfectly neutral (1.0) — an unenrolled caller is not inherently suspicious,
+#   and this system must not punish every unenrolled legitimate caller just
+#   because no voiceprint exists for them.
+CONTACT_FAMILIARITY_MULTIPLIERS: dict[str, float] = {
+    "known_match": 0.9,
+    "known_mismatch": 1.3,
+    "no_enrollment_data": 1.0,
+}
+
 
 # =============================================================================
 # 4. Runtime helpers
