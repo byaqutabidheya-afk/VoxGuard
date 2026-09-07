@@ -11,7 +11,9 @@ be deployed independently while sharing the same core library.
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,13 @@ import gradio as gr
 import numpy as np
 
 from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.fusion.context import (
+    get_contact_familiarity_multiplier,
+    get_transaction_multiplier,
+)
+from voxguard.fusion.fuse import fuse_risk_with_context
+from voxguard.fusion.redflags import normalize_apostrophes, scan_for_redflags
+from voxguard.fusion.transcribe import LiveTranscriber
 from voxguard.privacy.session_log import SessionLogger
 from voxguard.risk.bands import score_to_band
 from voxguard.risk.prevention import get_prevention_message
@@ -36,8 +45,16 @@ logger = logging.getLogger(__name__)
 
 _DETECTOR: WeightedAverageDetector | None = None
 _SPEAKER_EMBEDDER: SpeakerEmbedder | None = None
+_TRANSCRIBER: LiveTranscriber | None = None
 _SESSION_LOGGER = SessionLogger()
 _SESSION_LOGGER.purge_older_than(30)
+
+TRANSACTION_CHOICES: list[tuple[str, str]] = [
+    ("General conversation (1.0x)", "general_conversation"),
+    ("OTP request (1.3x)", "otp_request"),
+    ("Fund transfer (1.5x)", "fund_transfer"),
+    ("Confidential info request (1.4x)", "confidential_info_request"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +65,7 @@ _SESSION_LOGGER.purge_older_than(30)
 # ─────────────────────────
 # Every element that carries an explicit `background` must also carry an
 # explicit `color` referencing a shade that contrasts against *that
-# background*, not against the page.  Gradio's dark-mode theme sets a
+# background*, not against the page. Gradio's dark-mode theme sets a
 # near-white inherited foreground on all elements; once we paint our own
 # background we can no longer rely on inheritance — we own the foreground.
 #
@@ -66,13 +83,12 @@ _BAND_STYLES: dict[str, dict[str, str]] = {
         "text": "#0d3b1e",      # very dark green  — 10.2:1 on #d4edda
         "muted": "#2d6a3f",     # dark green        —  5.1:1 on #d4edda
         "label": "LOW RISK",
-        # prevention bg — unused for low, included for consistency
         "prev_bg": "#d4edda",
         "prev_text": "#0d3b1e",
     },
     "medium": {
         "bg": "#fff3cd",        # light amber tint
-        "border": "#d97706",    # darker amber border (was #ffc107 — poor contrast)
+        "border": "#d97706",    # darker amber border
         "text": "#3d2000",      # very dark brown   — 11.4:1 on #fff3cd
         "muted": "#7a4400",     # dark amber-brown  —  5.4:1 on #fff3cd
         "label": "MEDIUM RISK",
@@ -103,33 +119,77 @@ _BAND_STYLES: dict[str, dict[str, str]] = {
 def _risk_html(
     probability_synthetic: float | None,
     context: str = "",
+    base_fused_score: float | None = None,
+    audio_score: float | None = None,
+    keyword_score: float | None = None,
+    transaction_multiplier: float | None = None,
+    contact_multiplier: float | None = None,
 ) -> str:
-    """Return an HTML block showing the color-coded risk band + raw probability.
+    """Return an HTML block showing the color-coded overall contextual call risk band.
 
-    All colors are set explicitly on every element so the block is readable
-    in both Gradio light mode and dark mode regardless of theme inheritance.
+    NOTE on Phase 7 vs. Phase 9 Semantics:
+    ───────────────────────────────────────
+    In Phase 7, this meter measured raw "audio cloning risk". In Phase 9, it
+    represents "overall contextual call risk" — the fusion of acoustic cloning
+    detection (70%), semantic red-flag phrase scanning (30%), transaction stakes
+    multipliers (e.g. fund transfer 1.5x), and contact voiceprint verification
+    multipliers (match 0.9x / mismatch 1.3x).
 
     Parameters
     ----------
     probability_synthetic:
-        Raw classifier output in [0, 1], or None (silence / non-speech gate).
+        Contextual call risk score in [0, 1], or None (silence / non-speech gate).
     context:
         Short descriptive label shown above the band badge, e.g.
         "Whole-Clip" or "Streaming Simulation".
+    base_fused_score:
+        Audio + Keyword weighted sum before context multipliers.
+    audio_score:
+        Raw acoustic synthetic score.
+    keyword_score:
+        Raw transcript red-flag risk score.
+    transaction_multiplier:
+        Multiplier from transaction context (e.g. 1.5 for fund transfer).
+    contact_multiplier:
+        Multiplier from voiceprint verification (0.9 match, 1.3 mismatch).
     """
     band = score_to_band(probability_synthetic)
     s = _BAND_STYLES[band]
 
     prob_text = (
-        f"Raw probability: {probability_synthetic:.4f}"
+        f"Contextual Call Risk: {probability_synthetic:.4f}"
         if probability_synthetic is not None
-        else "Raw probability: N/A (no speech detected)"
+        else "Contextual Call Risk: N/A (no speech detected)"
     )
     prob_line = (
-        f'<p style="margin:4px 0 0 0; font-size:0.82em; '
-        f"color:{s['muted']}; background:transparent;\">"
+        f'<p style="margin:4px 0 0 0; font-size:0.92em; font-weight:600; '
+        f"color:{s['text']}; background:transparent;\">"
         f"{prob_text}</p>"
     )
+
+    breakdown_lines: list[str] = []
+    if base_fused_score is not None:
+        breakdown_lines.append(
+            f"Base fused score (70% audio + 30% text): <b>{base_fused_score:.4f}</b>"
+        )
+    if audio_score is not None and keyword_score is not None:
+        breakdown_lines.append(
+            f"Signals: Audio score = {audio_score:.4f} · Red-flag score = {keyword_score:.4f}"
+        )
+    if transaction_multiplier is not None and contact_multiplier is not None:
+        breakdown_lines.append(
+            f"Multipliers: Transaction ×{transaction_multiplier:.2f} · Contact ×{contact_multiplier:.2f}"
+        )
+
+    breakdown_html = ""
+    if breakdown_lines:
+        items = "<br>".join(breakdown_lines)
+        breakdown_html = (
+            f'<div style="margin-top:8px; padding-top:6px; border-top:1px dashed {s["border"]}; '
+            f'font-size:0.80em; color:{s["muted"]}; line-height:1.4;">'
+            f"{items}"
+            f"</div>"
+        )
 
     context_line = (
         f'<p style="margin:0 0 4px 0; font-size:0.78em; font-weight:600; '
@@ -153,26 +213,83 @@ def _risk_html(
         f"color:{s['text']}; background:transparent;\">"
         f"{s['label']}</p>"
         f"{prob_line}"
+        f"{breakdown_html}"
         f"</div>"
     )
 
 
 # ---------------------------------------------------------------------------
+# Transcript & Red-flag visual rendering
+# ---------------------------------------------------------------------------
+
+
+def _render_transcript_html(
+    text: str,
+    matched_phrases: list[str],
+    categories: list[str],
+) -> str:
+    """Renders the transcript with matched red-flag phrases highlighted in <mark> tags."""
+    if not text or not text.strip():
+        return (
+            '<div style="background:#f8f9fa; color:#666; border:1px solid #ced4da; '
+            'border-radius:6px; padding:12px; font-style:italic;">'
+            "No speech transcribed yet."
+            "</div>"
+        )
+
+    clean_text = text.strip()
+
+    # Highlight matched phrases using a single union regex to avoid nested <mark> corruption
+    if matched_phrases:
+        sorted_phrases = sorted(matched_phrases, key=len, reverse=True)
+        union_escaped = "|".join(re.escape(p) for p in sorted_phrases)
+        pattern = rf"(?i)\b(?:{union_escaped})\b"
+
+        def _replace_match(m: re.Match) -> str:
+            matched_str = html.escape(m.group(0))
+            return (
+                f'<mark style="background:#ffeb3b; color:#212121; padding:2px 4px; '
+                f'border-radius:3px; font-weight:600;">{matched_str}</mark>'
+            )
+
+        highlighted_body = re.sub(pattern, _replace_match, clean_text)
+    else:
+        highlighted_body = html.escape(clean_text)
+
+    badge_html = ""
+    if categories:
+        badges = " ".join(
+            f'<span style="background:#ffebee; color:#c62828; border:1px solid #ef9a9a; '
+            f'padding:2px 6px; border-radius:4px; font-size:0.8em; font-weight:600; '
+            f'text-transform:uppercase;">{cat.replace("_", " ")}</span>'
+            for cat in categories
+        )
+        badge_html = (
+            f'<div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">'
+            f'<strong style="font-size:0.85em; color:#495057;">Red-flag categories:</strong> {badges}'
+            f"</div>"
+        )
+
+    return (
+        f'<div style="background:#f8f9fa; color:#212529; border:1px solid #ced4da; '
+        f'border-radius:6px; padding:12px; font-size:0.92em; line-height:1.5;">'
+        f'<div style="margin-bottom:6px; font-weight:600; color:#495057;">Transcript:</div>'
+        f'<div style="color:#212529;">{highlighted_body}</div>'
+        f"{badge_html}"
+        f"</div>"
+    )
+
+
+
+# ---------------------------------------------------------------------------
 # Prevention prompt rendering
 # ---------------------------------------------------------------------------
-# Message copy lives in voxguard.risk.prevention (MEDIUM_RISK_MESSAGE,
-# HIGH_RISK_MESSAGE).  This function is responsible only for wrapping that
-# text in styled HTML — it never owns the copy itself.
 
 
 def _prevention_html(band: str) -> str:
     """Return an HTML prevention-prompt block for medium/high bands.
 
     Returns an empty string for low and inconclusive (no alert fatigue).
-
-    All colors are set explicitly — background, text, list items, strong
-    tags — so the block is readable in both Gradio light mode and dark mode
-    regardless of any inherited theme foreground.
     """
     if band not in ("medium", "high"):
         return ""
@@ -181,15 +298,10 @@ def _prevention_html(band: str) -> str:
     accent = s["border"]
     bg = s["prev_bg"]
     fg = s["prev_text"]
-    md_text = get_prevention_message(band)  # sourced from voxguard.risk.prevention
-
-    # Convert simple markdown (bold **…** and bullets -) to HTML inline.
-    import re
+    md_text = get_prevention_message(band)
 
     html_text = re.sub(
         r"\*\*(.*?)\*\*",
-        # <strong> needs an explicit color too — it inherits from the <div>,
-        # but some browsers / Gradio shadow-DOM resets strip that; be explicit.
         lambda m: (
             f'<strong style="color:{fg}; background:transparent;">'
             f"{m.group(1)}</strong>"
@@ -241,9 +353,6 @@ def _prevention_html(band: str) -> str:
 # ---------------------------------------------------------------------------
 # Voiceprint verification result rendering
 # ---------------------------------------------------------------------------
-# Reuses _BAND_STYLES's "low" (green) and "high" (red) palettes so a MATCH/
-# MISMATCH card reads consistently with the risk meter above, per the same
-# contrast rules (every background carries an explicit, paired foreground).
 
 
 def _voiceprint_result_html(result: dict[str, Any]) -> str:
@@ -314,6 +423,14 @@ def get_speaker_embedder() -> SpeakerEmbedder:
     return _SPEAKER_EMBEDDER
 
 
+def get_transcriber() -> LiveTranscriber:
+    """Lazy-initializes and returns the shared LiveTranscriber instance."""
+    global _TRANSCRIBER
+    if _TRANSCRIBER is None:
+        _TRANSCRIBER = LiveTranscriber(model_size="base")
+    return _TRANSCRIBER
+
+
 def create_session(sample_rate: int | None = None) -> StreamingSession:
     """Creates a new StreamingSession instance with the shared detector."""
     return StreamingSession(detector=get_detector(), sample_rate=sample_rate)
@@ -327,12 +444,15 @@ def create_session(sample_rate: int | None = None) -> StreamingSession:
 def process_audio_chunk(
     audio: tuple[int, np.ndarray] | None,
     session: StreamingSession | None,
-) -> tuple[StreamingSession, str, str, str, str]:
-    """Processes an incoming streaming audio chunk and updates session risk state.
+    tx_context: str = "general_conversation",
+    last_voiceprint_result: dict[str, Any] | None = None,
+    transcript_state: str = "",
+) -> tuple[StreamingSession, str, str, str, str, str, str]:
+    """Processes an incoming streaming audio chunk and updates contextual risk state.
 
     Returns
     -------
-    session, risk_html, prevention_html, flagged_str, seconds_to_flag_str
+    session, risk_html, prevention_html, transcript_html, flagged_str, seconds_to_flag_str, transcript_state
     """
     if audio is None:
         if session is None:
@@ -345,13 +465,36 @@ def process_audio_chunk(
             if session._seconds_to_flag is not None
             else "N/A"
         )
-        band = score_to_band(running_score)
+
+        redflags = scan_for_redflags(transcript_state)
+        kw_score = float(redflags["keyword_risk_score"])
+        fusion_res = fuse_risk_with_context(
+            audio_score=running_score,
+            keyword_risk_score=kw_score,
+            transaction_context=tx_context,
+            voiceprint_result=last_voiceprint_result,
+        )
+        contextual_score = fusion_res["contextual_score"]
+        band = score_to_band(contextual_score)
+
         return (
             session,
-            _risk_html(running_score),
+            _risk_html(
+                contextual_score,
+                context="Live Streaming",
+                base_fused_score=fusion_res["base_fused_score"],
+                audio_score=running_score,
+                keyword_score=kw_score,
+                transaction_multiplier=fusion_res["transaction_multiplier"],
+                contact_multiplier=fusion_res["contact_multiplier"],
+            ),
             _prevention_html(band),
+            _render_transcript_html(
+                transcript_state, redflags["matched_phrases"], redflags["categories"]
+            ),
             str(flagged),
             s2f_str,
+            transcript_state,
         )
 
     sr, waveform = audio
@@ -367,22 +510,6 @@ def process_audio_chunk(
     if y.ndim > 1:
         y = np.mean(y, axis=1)
 
-    try:
-        buf_sr = float(session.buffer.sample_rate)
-        chunk_s = float(session.buffer.chunk_samples)
-        stride_s = float(session.buffer.stride_samples)
-        print(
-            f"[DEBUG Gradio Audio Chunk] incoming_sr={sr!r}, "
-            f"raw_shape={getattr(waveform, 'shape', None)}, raw_dtype={getattr(waveform, 'dtype', None)}, "
-            f"processed_samples={y.size}, "
-            f"buffer_sr={int(buf_sr)}, chunk_samples={int(chunk_s)} "
-            f"({chunk_s / buf_sr:.2f}s), "
-            f"stride_samples={int(stride_s)} "
-            f"({stride_s / buf_sr:.2f}s)"
-        )
-    except Exception:
-        pass
-
     if y.size == 0:
         current_score = session.risk_score.current()
         running_score = 0.0 if current_score is None else float(current_score)
@@ -392,44 +519,111 @@ def process_audio_chunk(
             if session._seconds_to_flag is not None
             else "N/A"
         )
-        band = score_to_band(running_score)
+        redflags = scan_for_redflags(transcript_state)
+        kw_score = float(redflags["keyword_risk_score"])
+        fusion_res = fuse_risk_with_context(
+            audio_score=running_score,
+            keyword_risk_score=kw_score,
+            transaction_context=tx_context,
+            voiceprint_result=last_voiceprint_result,
+        )
+        contextual_score = fusion_res["contextual_score"]
+        band = score_to_band(contextual_score)
+
         return (
             session,
-            _risk_html(running_score),
+            _risk_html(
+                contextual_score,
+                context="Live Streaming",
+                base_fused_score=fusion_res["base_fused_score"],
+                audio_score=running_score,
+                keyword_score=kw_score,
+                transaction_multiplier=fusion_res["transaction_multiplier"],
+                contact_multiplier=fusion_res["contact_multiplier"],
+            ),
             _prevention_html(band),
+            _render_transcript_html(
+                transcript_state, redflags["matched_phrases"], redflags["categories"]
+            ),
             str(flagged),
             s2f_str,
+            transcript_state,
         )
 
+    # 1. Acoustic streaming score
     result = session.push_audio(y, sr=sr)
     running_score = float(result["running_score"])
     flagged = bool(result["flagged"])
     s2f = result["seconds_to_flag"]
     s2f_str = f"{s2f:.2f}s" if s2f is not None else "N/A"
-    band = score_to_band(running_score)
+
+    # 2. Live streaming chunk transcription
+    try:
+        transcriber = get_transcriber()
+        chunk_text = transcriber.transcribe_chunk(y, sr)
+        if chunk_text:
+            if transcript_state:
+                accumulated_transcript = f"{transcript_state} {chunk_text}".strip()
+            else:
+                accumulated_transcript = chunk_text.strip()
+        else:
+            accumulated_transcript = transcript_state
+    except Exception as exc:
+        logger.warning("Live transcription chunk error: %s", exc)
+        accumulated_transcript = transcript_state
+
+    # 3. Red-flag keyword scan
+    redflags = scan_for_redflags(accumulated_transcript)
+    kw_score = float(redflags["keyword_risk_score"])
+
+    # 4. Contextual risk fusion
+    fusion_res = fuse_risk_with_context(
+        audio_score=running_score,
+        keyword_risk_score=kw_score,
+        transaction_context=tx_context,
+        voiceprint_result=last_voiceprint_result,
+    )
+    contextual_score = fusion_res["contextual_score"]
+    band = score_to_band(contextual_score)
 
     if flagged and not getattr(session, "_logged_flag_event", False):
         session._logged_flag_event = True
         _SESSION_LOGGER.log_event(
             event_type="flag_event",
             risk_band=band,
-            probability_synthetic=running_score,
+            probability_synthetic=contextual_score,
             flagged=flagged,
         )
 
+    risk_html = _risk_html(
+        contextual_score,
+        context="Live Streaming",
+        base_fused_score=fusion_res["base_fused_score"],
+        audio_score=running_score,
+        keyword_score=kw_score,
+        transaction_multiplier=fusion_res["transaction_multiplier"],
+        contact_multiplier=fusion_res["contact_multiplier"],
+    )
+    prevention_html = _prevention_html(band)
+    transcript_html = _render_transcript_html(
+        accumulated_transcript, redflags["matched_phrases"], redflags["categories"]
+    )
+
     return (
         session,
-        _risk_html(running_score),
-        _prevention_html(band),
+        risk_html,
+        prevention_html,
+        transcript_html,
         str(flagged),
         s2f_str,
+        accumulated_transcript,
     )
 
 
 def reset_streaming_session(
     session: StreamingSession | None,
-) -> tuple[StreamingSession, str, str, str, str]:
-    """Resets the streaming session and returns cleared indicators."""
+) -> tuple[StreamingSession, str, str, str, str, str, str]:
+    """Resets the streaming session, clears transcript, and returns reset indicators."""
     if session is not None:
         current_score = session.risk_score.current()
         current_prob = 0.0 if current_score is None else float(current_score)
@@ -442,7 +636,15 @@ def reset_streaming_session(
         session.reset()
     else:
         session = create_session()
-    return session, _risk_html(0.0), "", "False", "N/A"
+    return (
+        session,
+        _risk_html(0.0),
+        "",
+        _render_transcript_html("", [], []),
+        "False",
+        "N/A",
+        "",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,87 +654,124 @@ def reset_streaming_session(
 
 def analyze_uploaded_file(
     audio_path: str | None,
-) -> tuple[str, str, str, str]:
-    """Run whole-clip and streaming-simulation analysis on an uploaded audio file.
+    tx_context: str = "general_conversation",
+    last_voiceprint_result: dict[str, Any] | None = None,
+) -> tuple[str, str, str, str, str]:
+    """Run whole-clip, streaming-simulation, and transcript analysis on an uploaded audio file.
 
     Returns
     -------
-    whole_risk_html, whole_prevention_html, stream_risk_html, stream_prevention_html
+    whole_risk_html, whole_prevention_html, stream_risk_html, stream_prevention_html, transcript_html
     """
     if audio_path is None:
         placeholder = (
             '<p style="color:#666; font-style:italic;">Upload a file and click Analyze.</p>'
         )
-        return placeholder, "", placeholder, ""
+        return placeholder, "", placeholder, "", _render_transcript_html("", [], [])
 
     waveform, sr = load_audio(audio_path, target_sr=16_000)
     duration = float(len(waveform)) / float(sr)
 
-    # ---- Whole-clip -------------------------------------------------------
-    whole_clip = get_detector().predict_waveform(waveform, sr)
-    probability = whole_clip.get("probability_synthetic")
-    probability = None if probability is None else float(probability)
+    # 1. Full-file transcription & red-flag scanning
+    transcriber = get_transcriber()
+    try:
+        full_text = transcriber.transcribe_full(audio_path)
+    except Exception as exc:
+        logger.warning("transcribe_full failed on '%s': %s", audio_path, exc)
+        full_text = ""
 
-    whole_band = score_to_band(probability)
-    whole_risk = _risk_html(probability, context=f"Whole-Clip · {duration:.2f}s")
+    redflags = scan_for_redflags(full_text)
+    kw_score = float(redflags["keyword_risk_score"])
+    transcript_html = _render_transcript_html(
+        full_text, redflags["matched_phrases"], redflags["categories"]
+    )
+
+    # 2. Whole-clip analysis & fusion
+    whole_clip = get_detector().predict_waveform(waveform, sr)
+    audio_probability = whole_clip.get("probability_synthetic")
+    raw_audio_score = 0.0 if audio_probability is None else float(audio_probability)
+
+    whole_fusion = fuse_risk_with_context(
+        audio_score=raw_audio_score,
+        keyword_risk_score=kw_score,
+        transaction_context=tx_context,
+        voiceprint_result=last_voiceprint_result,
+    )
+    whole_contextual = whole_fusion["contextual_score"]
+    whole_band = score_to_band(whole_contextual)
+    whole_risk = _risk_html(
+        whole_contextual,
+        context=f"Whole-Clip · {duration:.2f}s",
+        base_fused_score=whole_fusion["base_fused_score"],
+        audio_score=raw_audio_score,
+        keyword_score=kw_score,
+        transaction_multiplier=whole_fusion["transaction_multiplier"],
+        contact_multiplier=whole_fusion["contact_multiplier"],
+    )
     whole_prev = _prevention_html(whole_band)
 
     _SESSION_LOGGER.log_event(
         event_type="upload_analysis_whole_clip",
         risk_band=whole_band,
-        probability_synthetic=probability if probability is not None else 0.0,
+        probability_synthetic=whole_contextual,
         flagged=whole_band in ("medium", "high"),
     )
 
-    # ---- Streaming simulation ---------------------------------------------
+    # 3. Streaming simulation & fusion
     session = create_session()
     summary = simulate_stream(
         audio=waveform,
         session=session,
         real_time_paced=False,
     )
-    stream_prob = float(summary.get("final_running_score", 0.0))
+    stream_audio_score = float(summary.get("final_running_score", 0.0))
     stream_flagged = bool(summary.get("flagged", False))
     stream_s2f = summary.get("seconds_to_flag")
     stream_s2f_str = f"{stream_s2f:.2f}s" if stream_s2f is not None else "N/A"
 
-    stream_band = score_to_band(stream_prob)
+    stream_fusion = fuse_risk_with_context(
+        audio_score=stream_audio_score,
+        keyword_risk_score=kw_score,
+        transaction_context=tx_context,
+        voiceprint_result=last_voiceprint_result,
+    )
+    stream_contextual = stream_fusion["contextual_score"]
+    stream_band = score_to_band(stream_contextual)
     stream_context = (
         f"Streaming Simulation · flagged={stream_flagged} · "
         f"time-to-flag={stream_s2f_str}"
     )
-    stream_risk = _risk_html(stream_prob, context=stream_context)
+    stream_risk = _risk_html(
+        stream_contextual,
+        context=stream_context,
+        base_fused_score=stream_fusion["base_fused_score"],
+        audio_score=stream_audio_score,
+        keyword_score=kw_score,
+        transaction_multiplier=stream_fusion["transaction_multiplier"],
+        contact_multiplier=stream_fusion["contact_multiplier"],
+    )
     stream_prev = _prevention_html(stream_band)
 
     _SESSION_LOGGER.log_event(
         event_type="upload_analysis_streaming",
         risk_band=stream_band,
-        probability_synthetic=stream_prob,
+        probability_synthetic=stream_contextual,
         flagged=stream_flagged,
     )
 
-    return whole_risk, whole_prev, stream_risk, stream_prev
+    return whole_risk, whole_prev, stream_risk, stream_prev, transcript_html
 
 
 # ---------------------------------------------------------------------------
 # Voiceprint Verification tab callbacks
 # ---------------------------------------------------------------------------
-# gr.Audio in the pinned Gradio version (4.44.1) has no multi-file/file_count
-# option — its `value` type is a single str|Path|(sr, array), not a list — so
-# multi-clip enrollment uses an "add another clip" pattern instead: one
-# gr.Audio recorder/uploader, an "Add Clip" button that appends its path to a
-# gr.State list, and "Enroll" consuming the accumulated list.
 
 
 def add_reference_clip(
     clip_path: str | None,
     clips: list[str],
 ) -> tuple[list[str], str, Any]:
-    """Appends one recorded/uploaded clip's path to the enrollment clip list.
-
-    Returns the updated list, its display text, and a reset (cleared)
-    audio-input value so the recorder is ready for the next take.
-    """
+    """Appends one recorded/uploaded clip's path to the enrollment clip list."""
     clips = list(clips or [])
     if clip_path:
         clips.append(clip_path)
@@ -543,12 +782,7 @@ def do_enroll(
     name: str | None,
     clips: list[str],
 ) -> tuple[str, Any, list[str], str]:
-    """Enrolls a speaker from the accumulated reference-clip list.
-
-    Returns a status message, an updated enrolled-speaker dropdown, and a
-    reset clip list/display (successful enrollment clears the working list
-    so the next enrollment doesn't accidentally reuse this speaker's clips).
-    """
+    """Enrolls a speaker from the accumulated reference-clip list."""
     clips = list(clips or [])
 
     if not name or not name.strip():
@@ -602,11 +836,7 @@ def do_verify(
     selected_name: str | None,
     clip_path: str | None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Verifies a clip against the selected enrolled speaker's voiceprint.
-
-    Returns the rendered result card and the raw verify_speaker() result
-    (or None) to store in the shared last_voiceprint_result state.
-    """
+    """Verifies a clip against the selected enrolled speaker's voiceprint."""
     if not selected_name:
         return (
             _voiceprint_placeholder_html("Select an enrolled speaker first."),
@@ -642,17 +872,16 @@ def do_verify(
 # ---------------------------------------------------------------------------
 
 _DISCLAIMER = (
-    "VoxGuard is a hackathon prototype that detects AI-cloned voice in call audio "
-    "using dual embedding backbones and streaming risk scoring. This demo simulates "
-    "call audio via live microphone input or uploaded files — it does **not** intercept "
-    "real telecom traffic. All processing runs locally on your machine."
+    "VoxGuard is a real-time voice cloning detection and prevention safeguard built "
+    "using dual embedding backbones (wav2vec2 + WavLM), streaming risk scoring, "
+    "multimodal context fusion (faster-whisper + red-flag scanner), and speaker voiceprint verification. "
+    "All processing runs locally on your machine."
 )
 
 _DIVERGENCE_NOTE = (
-    "> **Why two meters?** Whole-clip and streaming analysis can disagree on the same "
-    "audio — whole-clip sees the full waveform at once, streaming makes incremental "
-    "decisions. Both results are shown independently so you can see the difference "
-    "rather than have it hidden by averaging."
+    "> **Why two meters?** Whole-clip and streaming analysis evaluate audio from complementary "
+    "perspectives — whole-clip inspects the complete waveform at once, streaming makes incremental "
+    "sliding-window decisions. Both results are enriched with contextual multipliers and shown independently."
 )
 
 
@@ -662,13 +891,7 @@ def build_app() -> gr.Blocks:
         gr.Markdown("# VoxGuard — Voice Cloning Detection & Prevention")
         gr.Markdown(_DISCLAIMER)
 
-        # App-level shared state (not nested in any single tab): Phase 9's
-        # fusion UI reads this same state object to fold "is this a known
-        # contact" into its risk score, so both the state's name and its
-        # shape — exactly {"match": bool, "similarity": float,
-        # "enrolled_name": str}, or None before any verification has run —
-        # are a contract that phase depends on. Only the Voiceprint
-        # Verification tab's Verify button writes to it.
+        # App-level shared state for voiceprint verification across tabs
         last_voiceprint_result: gr.State = gr.State(value=None)
 
         with gr.Tabs():
@@ -679,9 +902,12 @@ def build_app() -> gr.Blocks:
             with gr.Tab("Live Mic"):
                 gr.Markdown(
                     "Speak into the microphone to stream audio in real time. "
-                    "VoxGuard continuously scores chunked risk and flags sustained anomalies."
+                    "VoxGuard continuously calculates overall contextual call risk by combining "
+                    "acoustic synthetic voice detection with live speech-to-text red-flag scanning "
+                    "and situational context multipliers."
                 )
                 session_state = gr.State(create_session)
+                mic_transcript_state = gr.State("")
 
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -691,37 +917,56 @@ def build_app() -> gr.Blocks:
                             type="numpy",
                             label="Live Mic Input",
                         )
+                        tx_context_mic = gr.Dropdown(
+                            choices=TRANSACTION_CHOICES,
+                            value="general_conversation",
+                            label="Transaction / Call Context",
+                            info="Select what the call is about to apply risk multipliers.",
+                        )
                         reset_btn = gr.Button("Reset Session", variant="secondary")
 
                     with gr.Column(scale=1):
                         mic_risk_html = gr.HTML(
                             value=_risk_html(0.0),
-                            label="Risk Level",
+                            label="Contextual Risk Level",
                         )
                         mic_prevention_html = gr.HTML(
                             value="",
                             label="Prevention Guidance",
                         )
-                        mic_flagged_out = gr.Textbox(
-                            label="Flagged (Synthetic Voice Detected)",
-                            value="False",
-                            interactive=False,
+                        mic_transcript_html = gr.HTML(
+                            value=_render_transcript_html("", [], []),
+                            label="Live Call Transcript & Red-Flag Cues",
                         )
-                        mic_s2f_out = gr.Textbox(
-                            label="Seconds to Flag",
-                            value="N/A",
-                            interactive=False,
-                        )
+                        with gr.Row():
+                            mic_flagged_out = gr.Textbox(
+                                label="Acoustic Clone Flagged",
+                                value="False",
+                                interactive=False,
+                            )
+                            mic_s2f_out = gr.Textbox(
+                                label="Seconds to Flag",
+                                value="N/A",
+                                interactive=False,
+                            )
 
                 mic_input.stream(
                     fn=process_audio_chunk,
-                    inputs=[mic_input, session_state],
+                    inputs=[
+                        mic_input,
+                        session_state,
+                        tx_context_mic,
+                        last_voiceprint_result,
+                        mic_transcript_state,
+                    ],
                     outputs=[
                         session_state,
                         mic_risk_html,
                         mic_prevention_html,
+                        mic_transcript_html,
                         mic_flagged_out,
                         mic_s2f_out,
+                        mic_transcript_state,
                     ],
                 )
 
@@ -732,8 +977,10 @@ def build_app() -> gr.Blocks:
                         session_state,
                         mic_risk_html,
                         mic_prevention_html,
+                        mic_transcript_html,
                         mic_flagged_out,
                         mic_s2f_out,
+                        mic_transcript_state,
                     ],
                 )
 
@@ -742,8 +989,8 @@ def build_app() -> gr.Blocks:
             # ================================================================
             with gr.Tab("Upload File"):
                 gr.Markdown(
-                    "Upload an audio file to run both whole-clip detection and "
-                    "a fast streaming-simulation replay."
+                    "Upload an audio file to run whole-clip detection, streaming-simulation replay, "
+                    "and automated speech transcription with scam keyword detection."
                 )
                 gr.Markdown(_DIVERGENCE_NOTE)
 
@@ -755,9 +1002,20 @@ def build_app() -> gr.Blocks:
                             type="filepath",
                             label="Upload Audio File",
                         )
+                        tx_context_upload = gr.Dropdown(
+                            choices=TRANSACTION_CHOICES,
+                            value="general_conversation",
+                            label="Transaction / Call Context",
+                            info="Select what the call is about to apply risk multipliers.",
+                        )
                         analyze_btn = gr.Button("Analyze", variant="primary")
 
                     with gr.Column(scale=2):
+                        upload_transcript_html = gr.HTML(
+                            value=_render_transcript_html("", [], []),
+                            label="Call Transcript & Red-Flag Cues",
+                        )
+
                         gr.Markdown("### Whole-Clip Analysis")
                         upload_whole_risk = gr.HTML(
                             value=(
@@ -778,12 +1036,17 @@ def build_app() -> gr.Blocks:
 
                 analyze_btn.click(
                     fn=analyze_uploaded_file,
-                    inputs=[upload_audio],
+                    inputs=[
+                        upload_audio,
+                        tx_context_upload,
+                        last_voiceprint_result,
+                    ],
                     outputs=[
                         upload_whole_risk,
                         upload_whole_prev,
                         upload_stream_risk,
                         upload_stream_prev,
+                        upload_transcript_html,
                     ],
                 )
 
@@ -797,7 +1060,8 @@ def build_app() -> gr.Blocks:
                     "different question than the tabs above — not \"is this "
                     "voice synthetic,\" but \"is this who they claim to be\" — "
                     "which catches an attacker using a *different real* voice, "
-                    "not a clone at all."
+                    "not a clone at all. Successful or failed verification here "
+                    "automatically updates the contact familiarity multiplier across all tabs."
                 )
 
                 clips_state = gr.State([])

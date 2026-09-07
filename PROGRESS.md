@@ -327,18 +327,54 @@ isolation. ~24 hours remaining as of this update — see "Time Budget" note near
     loosest tied threshold (0.40, which actually had 2.67% FAR, not part of the true 0%/0% tie)
     instead of the correct, safer choice.
 
-## Phase 9+ — Not started
+## Phase 9 — Multimodal Call-Context Risk Fusion: DONE
+- `LiveTranscriber` (`src/voxguard/fusion/transcribe.py`): faster-whisper `base` model, CPU +
+  int8 (not a fallback — the intended, documented config for this hardware). Handles
+  Hindi/Hinglish via `language=None` (auto-detect); empirically, base model sometimes
+  auto-*translates* code-switched Hindi to English rather than transliterating (e.g. "aapka bank
+  account block ho jaayega" → "your bank account will be blocked") — meaning is preserved, exact
+  wording is not. Both `transcribe_chunk` (streaming) and `transcribe_full` (upload) implemented.
+- `redflags.py`: `RED_FLAG_PHRASES` (English + Hindi/Hinglish, 4 categories: urgency,
+  financial_action, authority_impersonation, isolation) + `scan_for_redflags()`. **Bug found and
+  fixed:** apostrophe punctuation variance (`"don't"` vs `"dont"` vs `"don't"` curly-quote) caused
+  false-negative matches on contraction-based phrases — fixed via a `normalize_apostrophes()`
+  helper applied symmetrically to both input text and dictionary patterns before matching, with
+  explicit test coverage for all three variants. (Note: the specific false-negative that
+  surfaced this during manual testing was itself an artifact of a PowerShell quote-escaping
+  workaround stripping an apostrophe from test text, not a real transcript — but the underlying
+  fix is genuinely valuable given real ASR output varies unpredictably in punctuation.)
+- `context.py`: `get_transaction_multiplier()` (general_conversation 1.0 / otp_request 1.3 /
+  fund_transfer 1.5 / confidential_info_request 1.4) and
+  `get_contact_familiarity_multiplier()` — **this is what finally consumes Phase 8's
+  `last_voiceprint_result`**, implementing the deliberate 3-state logic: known_match mildly
+  LOWERS risk (0.9, corroborating not proof — a good clone would also pass), known_mismatch
+  meaningfully RAISES risk (1.3), no_enrollment_data stays neutral (1.0, never punishes an
+  unenrolled legitimate caller). Malformed/None input verified to gracefully fall back to
+  neutral, never raises.
+- `fuse.py`: `fuse_risk()` (0.7 audio / 0.3 keyword weighted sum) and
+  `fuse_risk_with_context()` (applies both multipliers sequentially on top, returns BOTH
+  base_fused_score and contextual_score — deliberately not just the final number, since showing
+  "audio+language alone said X, context pushed it to Y" is the actual product story). Verified
+  end-to-end with a realistic worst-case scenario: high audio score (0.93) + high keyword score
+  (0.7) + OTP-request context + failed speaker verification → base 0.861 pushed to ceiling 1.0.
+  This is a strong, demonstrable data point for the demo narrative.
+- Gradio UI updated (both Live Mic and Upload File tabs): transcript display with highlighted
+  red-flag phrases, Transaction Context dropdown, contextual_score now drives the Phase 7 risk
+  meter/prevention prompt (base_fused_score shown alongside in smaller text for transparency).
+  **Risk meter's meaning has changed** — from "audio cloning risk" to "overall contextual call
+  risk" — UI labels updated accordingly, documented explicitly in code comments so this isn't a
+  silent semantic shift. Graceful fallback confirmed: a fresh session with no prior voiceprint
+  verification doesn't crash, correctly treats contact familiarity as neutral.
+
+## Phase 10+ — Not started
 
 ## Time Budget (as of this update)
-~24 hours remaining, per user. Guide's own estimates for what's left: Phase 9 (fusion) + Phase
-10 (explainability + FastAPI) + Phase 11 (demo rehearsal) likely 12-18+ hrs combined at the
-guide's pace, and this project's ACTUAL pace has consistently run longer than estimates (Phase 6
-alone consumed significant time on three dependency bugs + a sample-rate bug). Recommendation
-discussed with user: protect Phase 11 (rehearsal) time above all else — an unrehearsed live demo
-is a bigger risk than any single missing feature. If time gets tight, trim Phase 9/10 scope
-before cutting into Phase 11. Already have a genuinely strong 3-feature demo core as of Phase 8:
-clone detection + calibrated risk meter/prevention + speaker verification, all real-tested, not
-just built.
+Phases 1-9 complete. Per user, ~24 hrs were available as of Phase 8; Phase 9 has now also been
+completed within that budget. Remaining: Phase 10 (explainability + FastAPI) and Phase 11 (demo
+rehearsal — PROTECT THIS, do not let Phase 10 run long at its expense). Current demo core is
+genuinely strong and fully real-tested: clone detection + calibrated risk meter/prevention +
+speaker verification + contextual fusion (transcript, red-flags, transaction context, contact
+familiarity) all working end-to-end, not just individually built.
 - Phase 4 (Hindi/Hinglish track)
 - Phase 5 (real-time streaming + challenge-response)
 - Speaker voiceprint verification, multimodal call-context fusion, explainability overlay,

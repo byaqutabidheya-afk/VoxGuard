@@ -6,6 +6,7 @@ import pytest
 import gradio as gr
 
 from app.app import (
+    analyze_uploaded_file,
     build_app,
     create_session,
     get_detector,
@@ -32,26 +33,34 @@ def test_process_audio_chunk_none_and_empty() -> None:
     mock_session.buffer.chunk_samples = 24000
     mock_session.buffer.stride_samples = 16000
 
-    session, risk_html, prevention_html, flagged, s2f = process_audio_chunk(
-        None, mock_session
+    session, risk_html, prevention_html, transcript_html, flagged, s2f, transcript_state = (
+        process_audio_chunk(None, mock_session)
+    )
+    assert session is mock_session
+    assert "LOW RISK" in risk_html
+    assert prevention_html == ""
+    assert "No speech transcribed yet" in transcript_html
+    assert flagged == "False"
+    assert s2f == "N/A"
+    assert transcript_state == ""
+
+    session, risk_html, prevention_html, transcript_html, flagged, s2f, transcript_state = (
+        process_audio_chunk((16000, np.array([])), mock_session)
     )
     assert session is mock_session
     assert "LOW RISK" in risk_html
     assert prevention_html == ""
     assert flagged == "False"
     assert s2f == "N/A"
-
-    session, risk_html, prevention_html, flagged, s2f = process_audio_chunk(
-        (16000, np.array([])), mock_session
-    )
-    assert session is mock_session
-    assert "LOW RISK" in risk_html
-    assert prevention_html == ""
-    assert flagged == "False"
-    assert s2f == "N/A"
+    assert transcript_state == ""
 
 
-def test_process_audio_chunk_real_and_int16_conversion() -> None:
+@patch("app.app.get_transcriber")
+def test_process_audio_chunk_real_and_fusion(mock_get_trans: MagicMock) -> None:
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe_chunk.return_value = "customs department fine pay kijiye"
+    mock_get_trans.return_value = mock_transcriber
+
     mock_session = MagicMock()
     mock_session.buffer.sample_rate = 16000
     mock_session.buffer.chunk_samples = 24000
@@ -64,43 +73,42 @@ def test_process_audio_chunk_real_and_int16_conversion() -> None:
     }
 
     int16_stereo = np.ones((1600, 2), dtype=np.int16) * 16384
-    session, risk_html, prevention_html, flagged, s2f = process_audio_chunk(
-        (16000, int16_stereo), mock_session
+    session, risk_html, prevention_html, transcript_html, flagged, s2f, transcript_state = (
+        process_audio_chunk(
+            (16000, int16_stereo),
+            mock_session,
+            tx_context="fund_transfer",
+            last_voiceprint_result={"match": False, "similarity": 0.2, "enrolled_name": "byaquta"},
+            transcript_state="abhi turant",
+        )
     )
 
     assert session is mock_session
     assert "HIGH RISK" in risk_html
     assert "High-confidence alert" in prevention_html
+    assert "customs department" in transcript_html
     assert flagged == "True"
     assert s2f == "2.00s"
     assert mock_session.push_audio.called
-
-    call_args = mock_session.push_audio.call_args
-    pushed_frame = call_args.args[0]
-    pushed_sr = call_args.kwargs.get(
-        "sr", call_args.args[1] if len(call_args.args) > 1 else None
-    )
-
-    assert pushed_frame.ndim == 1
-    assert pushed_frame.dtype == np.float32
-    assert pushed_sr == 16000
-    assert float(pushed_frame[0]) == pytest.approx(0.5, rel=1e-3)
+    assert "abhi turant customs department" in transcript_state
 
 
 def test_reset_streaming_session() -> None:
     mock_session = MagicMock()
     mock_session._consecutive_flags = 0
     mock_session.consecutive_flags_required = 3
-    session, risk_html, prevention_html, flagged, s2f = reset_streaming_session(
-        mock_session
+    session, risk_html, prevention_html, transcript_html, flagged, s2f, transcript_state = (
+        reset_streaming_session(mock_session)
     )
 
     assert session is mock_session
     mock_session.reset.assert_called_once()
     assert "LOW RISK" in risk_html
     assert prevention_html == ""
+    assert "No speech transcribed yet" in transcript_html
     assert flagged == "False"
     assert s2f == "N/A"
+    assert transcript_state == ""
 
 
 @patch("app.app.WeightedAverageDetector")

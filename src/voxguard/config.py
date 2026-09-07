@@ -117,6 +117,13 @@ CONTACT_FAMILIARITY_MULTIPLIERS: dict[str, float] = {
     "no_enrollment_data": 1.0,
 }
 
+# Multimodal Risk Fusion Weights (Phase 7 / Prompt 9.5)
+# Audio-based acoustic cloning detection is the primary validated signal (0.7),
+# while semantic keyword scanning provides corroborating context (0.3).
+FUSION_AUDIO_WEIGHT: float = 0.7
+FUSION_KEYWORD_WEIGHT: float = 0.3
+
+
 
 # =============================================================================
 # 4. Runtime helpers
