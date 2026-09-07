@@ -12,6 +12,7 @@ be deployed independently while sharing the same core library.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import gradio as gr
@@ -21,12 +22,20 @@ from voxguard.classifier.ensemble import WeightedAverageDetector
 from voxguard.privacy.session_log import SessionLogger
 from voxguard.risk.bands import score_to_band
 from voxguard.risk.prevention import get_prevention_message
+from voxguard.speaker.embedding import SpeakerEmbedder
+from voxguard.speaker.enrollment import (
+    delete_speaker,
+    enroll_speaker,
+    list_enrolled_speakers,
+)
+from voxguard.speaker.verify import verify_speaker
 from voxguard.streaming.session import StreamingSession, simulate_stream
 from voxguard.utils.audio_io import load_audio
 
 logger = logging.getLogger(__name__)
 
 _DETECTOR: WeightedAverageDetector | None = None
+_SPEAKER_EMBEDDER: SpeakerEmbedder | None = None
 _SESSION_LOGGER = SessionLogger()
 _SESSION_LOGGER.purge_older_than(30)
 
@@ -230,6 +239,58 @@ def _prevention_html(band: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Voiceprint verification result rendering
+# ---------------------------------------------------------------------------
+# Reuses _BAND_STYLES's "low" (green) and "high" (red) palettes so a MATCH/
+# MISMATCH card reads consistently with the risk meter above, per the same
+# contrast rules (every background carries an explicit, paired foreground).
+
+
+def _voiceprint_result_html(result: dict[str, Any]) -> str:
+    """Renders a verify_speaker() result as a MATCH/MISMATCH styled card."""
+    match = bool(result["match"])
+    similarity = float(result["similarity"])
+    enrolled_name = str(result["enrolled_name"])
+
+    s = _BAND_STYLES["low" if match else "high"]
+    label = "MATCH" if match else "MISMATCH"
+
+    return (
+        f'<div style="'
+        f"background:{s['bg']}; "
+        f"color:{s['text']}; "
+        f"border:2px solid {s['border']}; "
+        f"border-radius:8px; "
+        f"padding:12px 16px; "
+        f'margin:4px 0;">'
+        f'<p style="margin:0 0 4px 0; font-size:0.78em; font-weight:600; '
+        f"color:{s['muted']}; background:transparent; "
+        f'text-transform:uppercase; letter-spacing:0.05em;">'
+        f"Voiceprint check vs. &#39;{enrolled_name}&#39;</p>"
+        f'<p style="margin:0; font-size:1.3em; font-weight:700; '
+        f"color:{s['text']}; background:transparent;\">"
+        f"{label}</p>"
+        f'<p style="margin:4px 0 0 0; font-size:0.82em; '
+        f"color:{s['muted']}; background:transparent;\">"
+        f"Cosine similarity: {similarity:.4f}</p>"
+        f"</div>"
+    )
+
+
+def _voiceprint_placeholder_html(message: str) -> str:
+    """Renders a neutral italic placeholder for the voiceprint result card."""
+    return f'<p style="color:#666; font-style:italic;">{message}</p>'
+
+
+def _format_clip_list(clips: list[str]) -> str:
+    """Renders the accumulated enrollment reference-clip list for display."""
+    if not clips:
+        return "No clips added yet."
+    lines = [f"{i + 1}. {Path(c).name}" for i, c in enumerate(clips)]
+    return f"{len(clips)} clip(s) added:\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Shared detector / session helpers
 # ---------------------------------------------------------------------------
 
@@ -243,6 +304,14 @@ def get_detector() -> WeightedAverageDetector:
             wavlm_classifier_path="models/classifiers/wavlm_hindi_combined_logreg.joblib",
         )
     return _DETECTOR
+
+
+def get_speaker_embedder() -> SpeakerEmbedder:
+    """Lazy-initializes and returns the shared SpeakerEmbedder instance."""
+    global _SPEAKER_EMBEDDER
+    if _SPEAKER_EMBEDDER is None:
+        _SPEAKER_EMBEDDER = SpeakerEmbedder()
+    return _SPEAKER_EMBEDDER
 
 
 def create_session(sample_rate: int | None = None) -> StreamingSession:
@@ -446,6 +515,129 @@ def analyze_uploaded_file(
 
 
 # ---------------------------------------------------------------------------
+# Voiceprint Verification tab callbacks
+# ---------------------------------------------------------------------------
+# gr.Audio in the pinned Gradio version (4.44.1) has no multi-file/file_count
+# option — its `value` type is a single str|Path|(sr, array), not a list — so
+# multi-clip enrollment uses an "add another clip" pattern instead: one
+# gr.Audio recorder/uploader, an "Add Clip" button that appends its path to a
+# gr.State list, and "Enroll" consuming the accumulated list.
+
+
+def add_reference_clip(
+    clip_path: str | None,
+    clips: list[str],
+) -> tuple[list[str], str, Any]:
+    """Appends one recorded/uploaded clip's path to the enrollment clip list.
+
+    Returns the updated list, its display text, and a reset (cleared)
+    audio-input value so the recorder is ready for the next take.
+    """
+    clips = list(clips or [])
+    if clip_path:
+        clips.append(clip_path)
+    return clips, _format_clip_list(clips), gr.update(value=None)
+
+
+def do_enroll(
+    name: str | None,
+    clips: list[str],
+) -> tuple[str, Any, list[str], str]:
+    """Enrolls a speaker from the accumulated reference-clip list.
+
+    Returns a status message, an updated enrolled-speaker dropdown, and a
+    reset clip list/display (successful enrollment clears the working list
+    so the next enrollment doesn't accidentally reuse this speaker's clips).
+    """
+    clips = list(clips or [])
+
+    if not name or not name.strip():
+        return (
+            "Please enter a speaker name before enrolling.",
+            gr.update(choices=list_enrolled_speakers()),
+            clips,
+            _format_clip_list(clips),
+        )
+    if not clips:
+        return (
+            "Add at least one reference clip before enrolling.",
+            gr.update(choices=list_enrolled_speakers()),
+            clips,
+            _format_clip_list(clips),
+        )
+
+    clean_name = name.strip()
+    try:
+        enroll_speaker(clean_name, clips, get_speaker_embedder())
+    except Exception as exc:
+        logger.exception("Voiceprint enrollment failed for '%s'", clean_name)
+        return (
+            f"Enrollment failed: {exc}",
+            gr.update(choices=list_enrolled_speakers()),
+            clips,
+            _format_clip_list(clips),
+        )
+
+    speakers = list_enrolled_speakers()
+    status = f"Enrolled '{clean_name}' from {len(clips)} reference clip(s)."
+    return status, gr.update(choices=speakers, value=clean_name), [], _format_clip_list([])
+
+
+def do_remove_enrollment(selected_name: str | None) -> tuple[str, Any]:
+    """Deletes the selected speaker's voiceprint (right-to-erasure control)."""
+    if not selected_name:
+        return "No speaker selected to remove.", gr.update(choices=list_enrolled_speakers())
+
+    deleted = delete_speaker(selected_name)
+    speakers = list_enrolled_speakers()
+    status = (
+        f"Removed enrollment for '{selected_name}'."
+        if deleted
+        else f"No enrollment found for '{selected_name}' — nothing to remove."
+    )
+    return status, gr.update(choices=speakers, value=None)
+
+
+def do_verify(
+    selected_name: str | None,
+    clip_path: str | None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Verifies a clip against the selected enrolled speaker's voiceprint.
+
+    Returns the rendered result card and the raw verify_speaker() result
+    (or None) to store in the shared last_voiceprint_result state.
+    """
+    if not selected_name:
+        return (
+            _voiceprint_placeholder_html("Select an enrolled speaker first."),
+            None,
+        )
+    if not clip_path:
+        return (
+            _voiceprint_placeholder_html("Provide a clip to verify and click Verify."),
+            None,
+        )
+
+    try:
+        waveform, sr = load_audio(clip_path, target_sr=16_000)
+        result = verify_speaker(waveform, sr, selected_name, get_speaker_embedder())
+    except FileNotFoundError:
+        return (
+            _voiceprint_placeholder_html(
+                f"No enrolled voiceprint found for '{selected_name}'."
+            ),
+            None,
+        )
+    except ValueError as exc:
+        return _voiceprint_placeholder_html(str(exc)), None
+    except Exception as exc:
+        logger.exception("Voiceprint verification failed for '%s'", selected_name)
+        return _voiceprint_placeholder_html(f"Verification failed: {exc}"), None
+
+    return _voiceprint_result_html(result), result
+
+
+# ---------------------------------------------------------------------------
 # UI layout
 # ---------------------------------------------------------------------------
 
@@ -469,6 +661,15 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="VoxGuard — Voice Cloning Detection & Prevention") as demo:
         gr.Markdown("# VoxGuard — Voice Cloning Detection & Prevention")
         gr.Markdown(_DISCLAIMER)
+
+        # App-level shared state (not nested in any single tab): Phase 9's
+        # fusion UI reads this same state object to fold "is this a known
+        # contact" into its risk score, so both the state's name and its
+        # shape — exactly {"match": bool, "similarity": float,
+        # "enrolled_name": str}, or None before any verification has run —
+        # are a contract that phase depends on. Only the Voiceprint
+        # Verification tab's Verify button writes to it.
+        last_voiceprint_result: gr.State = gr.State(value=None)
 
         with gr.Tabs():
 
@@ -584,6 +785,95 @@ def build_app() -> gr.Blocks:
                         upload_stream_risk,
                         upload_stream_prev,
                     ],
+                )
+
+            # ================================================================
+            # Voiceprint Verification tab
+            # ================================================================
+            with gr.Tab("Voiceprint Verification"):
+                gr.Markdown(
+                    "Enroll a trusted contact's voice, then verify whether a "
+                    "live or uploaded clip is actually them. This answers a "
+                    "different question than the tabs above — not \"is this "
+                    "voice synthetic,\" but \"is this who they claim to be\" — "
+                    "which catches an attacker using a *different real* voice, "
+                    "not a clone at all."
+                )
+
+                clips_state = gr.State([])
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Enroll a Speaker")
+                        enroll_name = gr.Textbox(
+                            label="Speaker Name",
+                            placeholder="e.g. priya",
+                        )
+                        enroll_clip_input = gr.Audio(
+                            sources=["microphone", "upload"],
+                            type="filepath",
+                            label="Reference Clip (2-3 clips of 5-10s recommended)",
+                        )
+                        add_clip_btn = gr.Button("Add Clip", variant="secondary")
+                        clips_display = gr.Textbox(
+                            label="Reference Clips Added",
+                            value=_format_clip_list([]),
+                            interactive=False,
+                            lines=4,
+                        )
+                        enroll_btn = gr.Button("Enroll", variant="primary")
+                        enroll_status = gr.Markdown(value="")
+
+                        gr.Markdown("### Enrolled Speakers")
+                        gr.Markdown(
+                            "Select a speaker below to remove their enrollment, or to "
+                            "verify a clip against them on the right."
+                        )
+                        enrolled_dropdown = gr.Dropdown(
+                            choices=list_enrolled_speakers(),
+                            label="Enrolled Speaker",
+                            value=None,
+                        )
+                        remove_btn = gr.Button("Remove Enrollment", variant="stop")
+                        remove_status = gr.Markdown(value="")
+
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Verify a Clip")
+                        verify_clip_input = gr.Audio(
+                            sources=["microphone", "upload"],
+                            type="filepath",
+                            label="Clip to Verify",
+                        )
+                        verify_btn = gr.Button("Verify", variant="primary")
+                        verify_result_html = gr.HTML(
+                            value=_voiceprint_placeholder_html(
+                                "Enroll a speaker on the left, then verify a clip "
+                                "against them here."
+                            )
+                        )
+
+                add_clip_btn.click(
+                    fn=add_reference_clip,
+                    inputs=[enroll_clip_input, clips_state],
+                    outputs=[clips_state, clips_display, enroll_clip_input],
+                )
+
+                enroll_btn.click(
+                    fn=do_enroll,
+                    inputs=[enroll_name, clips_state],
+                    outputs=[enroll_status, enrolled_dropdown, clips_state, clips_display],
+                )
+
+                remove_btn.click(
+                    fn=do_remove_enrollment,
+                    inputs=[enrolled_dropdown],
+                    outputs=[remove_status, enrolled_dropdown],
+                )
+
+                verify_btn.click(
+                    fn=do_verify,
+                    inputs=[enrolled_dropdown, verify_clip_input],
+                    outputs=[verify_result_html, last_voiceprint_result],
                 )
 
     return demo
