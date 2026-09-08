@@ -83,3 +83,12 @@ MEDIUM RISK example:
 
 HIGH RISK example:
   D:/VoxGuard/data/raw/asvspoof2019/LA/ASVspoof2019_LA_eval/flac/LA_E_2834763.flac | prob: 0.9997
+
+
+API starting command: 
+cd D:\VoxGuard
+.\.venv\Scripts\Activate.ps1
+uvicorn api.main:app --port 8000
+
+API ping command: 
+curl.exe http://127.0.0.1:8000/health
