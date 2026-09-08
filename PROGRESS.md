@@ -366,7 +366,56 @@ isolation. ~24 hours remaining as of this update — see "Time Budget" note near
   silent semantic shift. Graceful fallback confirmed: a fresh session with no prior voiceprint
   verification doesn't crash, correctly treats contact familiarity as neutral.
 
-## Phase 10+ — Not started
+## Phase 10 — Explainability Overlay: DONE
+- `spectrogram.py`: `generate_mel_spectrogram` (log-scaled mel, 128 bands) +
+  `render_spectrogram_image`. Visually confirmed clean, correct formant structure.
+- `attribution.py`: `windowed_attribution(waveform, sr, detector, window_seconds, stride_seconds)`
+  → `(scores, timestamps)` tuple (documented explicitly as a 2-tuple, not the originally-specced
+  single array — timestamps are needed for spectrogram alignment). Optional `gradient_saliency`
+  deliberately SKIPPED per explicit time-budget decision — `windowed_attribution` alone satisfies
+  the phase's requirements, and gradient-based saliency was assessed as 1.5-3 hrs of real
+  implementation risk (frozen-model gradient flow, dual-backbone combination, well-documented
+  noisy-saliency-map failure mode in ML literature) for a demo-invisible difference in output.
+  NaN handling is correct and intentional (silence-gate-skipped windows stay NaN, not a bug —
+  confirmed after real debugging time was spent on what turned out to be a numpy
+  min/mean/max-vs-nanmin/nanmean/nanmax summarization gotcha, not a code defect).
+- `overlay.py`: `render_explainability_overlay` — spectrogram + semi-transparent heatmap overlay.
+  **Two real rendering bugs found and fixed**: (1) heatmap alpha was fixed/high rather than
+  scaled by score, completely obscuring the spectrogram underneath; (2) NaN (silence) regions
+  rendered as solid black/max-intensity — the OPPOSITE of "no data" — fixed to fully transparent.
+- **Critical finding, same root cause as Issue #2/#3 in ISSUES.md**: chunk-level attribution at
+  the originally-specced 0.5s window size did NOT reliably separate real from synthetic — tested
+  on 2 verified Phase 6 demo pairs, one separated correctly, one was backwards (real scored
+  HIGHER than synthetic). Increasing to `window_seconds=1.5, stride_seconds=0.75` (now the
+  locked-in default) restored clean, correct, visually convincing separation specifically on
+  **soumya_neutral_01** (real nanmean 0.186, synthetic nanmean 0.747) — this is the ONE
+  fully-verified pair and should be treated as the demo pair for this feature.
+  `byaquta_neutral_01` also checked post-hoc at 1.5s: correctly lands real-side (0.301) but with
+  less margin than soumya's pair — usable as a backup, not the primary.
+  **Full explainability reliability, like streaming, is NOT assumed to generalize to arbitrary
+  clips — this is now a documented, expected limitation, not a hidden one.**
+- Gradio "Explainability" section added: displays overlay for the most recently analyzed clip
+  (via shared state, confirmed not stale), fixed caption disclosing the 1.5s/0.75s window
+  parameters, the reliability caveat, and a pointer to the full notes file.
+- **Added post-hoc: dynamic, per-clip explanation text** (`describe_attribution()`), replacing an
+  originally-requested "verified/unverified badge" idea with something more useful — 2-4
+  sentences reporting the clip's actual mean synthetic-likelihood, the highest/lowest-scoring
+  time regions (via nanargmax/nanargmin), and whether the score is consistent or highly variable
+  across the clip. Deliberately does NOT claim specific acoustic reasons ("unnatural pitch,"
+  etc.) the model has no evidence for — stays grounded in WHERE/HOW-CONSISTENT, never WHY in
+  acoustic terms, to avoid fabricating an explanation the classifier doesn't actually provide.
+  Verified working with real output, e.g.: "This clip was classified as synthetic with an
+  average synthetic-likelihood of 82%... strongest region around 0.0s (100%)... most natural
+  around 1.5s (25%)... varies notably across the clip."
+  Note: this triggered faster-Whisper's first-load cold start mid-testing (~3 min, silent/no
+  progress logging) which looked like a hang — confirmed benign, not a bug. **Add "one warm-up
+  Analyze click before demoing" to the Phase 11 rehearsal checklist** so this multi-minute
+  silent wait never happens live in front of judges (this is now the THIRD model — wav2vec2,
+  WavLM, Whisper — with this cold-start characteristic).
+- Findings appended to `PHASE5_STREAMING_NOTES.md` (kept in the same file as the related
+  streaming findings, given the shared root cause, rather than a new file).
+
+## Phase 11 — Not started (demo rehearsal — PROTECT THIS TIME)
 
 ## Time Budget (as of this update)
 Phases 1-9 complete. Per user, ~24 hrs were available as of Phase 8; Phase 9 has now also been

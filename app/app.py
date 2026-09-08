@@ -21,7 +21,13 @@ import gradio as gr
 import numpy as np
 
 from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.explain import (
+    describe_attribution,
+    render_explainability_overlay,
+    windowed_attribution,
+)
 from voxguard.fusion.context import (
+
     get_contact_familiarity_multiplier,
     get_transaction_multiplier,
 )
@@ -277,6 +283,22 @@ def _render_transcript_html(
         f'<div style="color:#212529;">{highlighted_body}</div>'
         f"{badge_html}"
         f"</div>"
+    )
+
+
+def _render_attribution_explanation_html(text: str) -> str:
+    """Renders the descriptive attribution text in a styled explanation card."""
+    if not text or not text.strip():
+        return ""
+    escaped = html.escape(text.strip())
+    return (
+        f'<div style="background:#f0f7ff; color:#1e3a8a; border:1px solid #bfdbfe; '
+        f'border-left:4px solid #2563eb; border-radius:6px; padding:12px 16px; '
+        f'margin:8px 0; font-size:0.92em; line-height:1.5;">'
+        f'<div style="margin-bottom:6px; font-weight:700; color:#1e40af; font-size:0.85em; '
+        f'text-transform:uppercase; letter-spacing:0.04em;">Attribution Analysis</div>'
+        f'<div style="color:#1e293b;">{escaped}</div>'
+        f'</div>'
     )
 
 
@@ -656,18 +678,19 @@ def analyze_uploaded_file(
     audio_path: str | None,
     tx_context: str = "general_conversation",
     last_voiceprint_result: dict[str, Any] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str | None]:
     """Run whole-clip, streaming-simulation, and transcript analysis on an uploaded audio file.
 
     Returns
     -------
-    whole_risk_html, whole_prevention_html, stream_risk_html, stream_prevention_html, transcript_html
+    whole_risk_html, whole_prevention_html, stream_risk_html, stream_prevention_html,
+    transcript_html, audio_path_passthrough
     """
     if audio_path is None:
         placeholder = (
             '<p style="color:#666; font-style:italic;">Upload a file and click Analyze.</p>'
         )
-        return placeholder, "", placeholder, "", _render_transcript_html("", [], [])
+        return placeholder, "", placeholder, "", _render_transcript_html("", [], []), None
 
     waveform, sr = load_audio(audio_path, target_sr=16_000)
     duration = float(len(waveform)) / float(sr)
@@ -759,7 +782,103 @@ def analyze_uploaded_file(
         flagged=stream_flagged,
     )
 
-    return whole_risk, whole_prev, stream_risk, stream_prev, transcript_html
+    return whole_risk, whole_prev, stream_risk, stream_prev, transcript_html, audio_path
+
+
+# ---------------------------------------------------------------------------
+# Explainability overlay callback
+# ---------------------------------------------------------------------------
+
+_OVERLAY_CAPTION = (
+    "**Explainability overlay** — coarse, chunk-level attribution using "
+    "1.5 s windows (stride 0.75 s, 50 % overlap). Each column of the heatmap "
+    "shows the detector's synthetic-likelihood score for that time region; "
+    "the spectrogram beneath shows the acoustic content. "
+    "**Reliability note:** individual time-points may not align with fine "
+    "acoustic detail — this is most reliable at clip granularity. "
+    "Verified directionally correct on the soumya_neutral_01 real/synthetic "
+    "pair; results on arbitrary clips are not guaranteed. "
+    "See `data/metadata/PHASE5_STREAMING_NOTES.md` § Phase 10 for full details."
+)
+
+_OVERLAY_OUTPUT_DIR = Path("data") / "processed" / "overlays"
+
+
+def generate_overlay(audio_path: str | None) -> tuple[str | None, str, str]:
+    """Generate the explainability overlay PNG and descriptive attribution for the last-analyzed clip.
+
+    Parameters
+    ----------
+    audio_path:
+        File path of the audio to overlay.  Comes from ``last_audio_state``
+        (the path stored by ``analyze_uploaded_file`` on its last run).
+
+    Returns
+    -------
+    image_path_or_none : str | None
+        Resolved path to the saved PNG, or ``None`` if generation failed.
+    status_html : str
+        Short status message rendered in the UI.
+    explanation_html : str
+        Descriptive rule-based explanation card rendered in the UI.
+    """
+    if audio_path is None:
+        return (
+            None,
+            (
+                '<p style="color:#888; font-style:italic;">'
+                "Analyze a clip first, then click Generate Overlay.</p>"
+            ),
+            "",
+        )
+
+    try:
+        waveform, sr = load_audio(audio_path, target_sr=16_000)
+    except Exception as exc:
+        logger.warning("generate_overlay: failed to load '%s': %s", audio_path, exc)
+        return None, f'<p style="color:#c0392b;">Could not load audio: {exc}</p>', ""
+
+    out_name = Path(audio_path).stem + "_overlay.png"
+    out_path = (_OVERLAY_OUTPUT_DIR / out_name).resolve()
+    detector = get_detector()
+
+    try:
+        saved = render_explainability_overlay(
+            waveform=waveform,
+            sr=sr,
+            detector=detector,
+            output_path=out_path,
+            # window_seconds and stride_seconds deliberately not overridden —
+            # render_explainability_overlay defaults are 1.5 s / 0.75 s,
+            # the empirically verified values from PHASE5_STREAMING_NOTES.md.
+        )
+        logger.debug("generate_overlay: saved overlay to %s", saved)
+
+        scores, timestamps = windowed_attribution(
+            waveform=waveform,
+            sr=sr,
+            detector=detector,
+        )
+        pred = detector.predict_waveform(waveform, sr)
+        label = str(pred.get("label", "real"))
+        desc = describe_attribution(scores=scores, timestamps=timestamps, label=label)
+        explanation_html = _render_attribution_explanation_html(desc)
+
+        status_html = (
+            '<p style="color:#2d6a3f; font-size:0.88em;">'
+            f"Overlay generated from: <code>{Path(audio_path).name}</code></p>"
+        )
+        return saved, status_html, explanation_html
+    except Exception as exc:
+        logger.exception("generate_overlay failed for '%s'", audio_path)
+        return (
+            None,
+            (
+                f'<p style="color:#c0392b;">Overlay generation failed: '
+                f"<code>{type(exc).__name__}: {exc}</code></p>"
+            ),
+            "",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1113,10 @@ def build_app() -> gr.Blocks:
                 )
                 gr.Markdown(_DIVERGENCE_NOTE)
 
+                # Stores the filepath of the most-recently analyzed clip so the
+                # explainability overlay always corresponds to the current verdict.
+                last_audio_state = gr.State(value=None)
+
                 with gr.Row():
                     with gr.Column(scale=1):
                         upload_audio = gr.Audio(
@@ -1034,6 +1157,27 @@ def build_app() -> gr.Blocks:
                         )
                         upload_stream_prev = gr.HTML(value="")
 
+                # ---- Explainability section --------------------------------
+                with gr.Accordion("Explainability Overlay & Attribution Analysis", open=False):
+                    gr.Markdown(
+                        "Generates a mel-spectrogram with a synthetic-likelihood heatmap "
+                        "overlay and rule-based attribution analysis for the clip analyzed above. "
+                        "Uses 1.5 s windows / 0.75 s stride (empirically verified defaults)."
+                    )
+                    overlay_btn = gr.Button(
+                        "Generate Explainability Overlay", variant="secondary"
+                    )
+                    overlay_status = gr.HTML(value="")
+                    overlay_explanation = gr.HTML(value="")
+                    overlay_image = gr.Image(
+                        label="Explainability Overlay",
+                        type="filepath",
+                        show_download_button=True,
+                        visible=True,
+                        value=None,
+                    )
+                    gr.Markdown(_OVERLAY_CAPTION)
+
                 analyze_btn.click(
                     fn=analyze_uploaded_file,
                     inputs=[
@@ -1047,7 +1191,14 @@ def build_app() -> gr.Blocks:
                         upload_stream_risk,
                         upload_stream_prev,
                         upload_transcript_html,
+                        last_audio_state,
                     ],
+                )
+
+                overlay_btn.click(
+                    fn=generate_overlay,
+                    inputs=[last_audio_state],
+                    outputs=[overlay_image, overlay_status, overlay_explanation],
                 )
 
             # ================================================================

@@ -6,9 +6,11 @@ import pytest
 import gradio as gr
 
 from app.app import (
+    _render_attribution_explanation_html,
     analyze_uploaded_file,
     build_app,
     create_session,
+    generate_overlay,
     get_detector,
     process_audio_chunk,
     reset_streaming_session,
@@ -120,3 +122,56 @@ def test_create_session_uses_detector(mock_detector_cls: MagicMock) -> None:
     session = create_session()
     assert isinstance(session, StreamingSession)
     assert app_module._DETECTOR is not None
+
+
+def test_render_attribution_explanation_html() -> None:
+    assert _render_attribution_explanation_html("") == ""
+    assert _render_attribution_explanation_html("   ") == ""
+    html_out = _render_attribution_explanation_html("This is a test <attribution> text.")
+    assert "Attribution Analysis" in html_out
+    assert "&lt;attribution&gt;" in html_out
+
+
+def test_generate_overlay_none() -> None:
+    img, status, expl = generate_overlay(None)
+    assert img is None
+    assert "Analyze a clip first" in status
+    assert expl == ""
+
+
+@patch("app.app.load_audio")
+def test_generate_overlay_load_error(mock_load: MagicMock) -> None:
+    mock_load.side_effect = RuntimeError("Failed to decode")
+    img, status, expl = generate_overlay("bad_file.wav")
+    assert img is None
+    assert "Could not load audio" in status
+    assert expl == ""
+
+
+@patch("app.app.load_audio")
+@patch("app.app.get_detector")
+@patch("app.app.render_explainability_overlay")
+@patch("app.app.windowed_attribution")
+def test_generate_overlay_success(
+    mock_attribution: MagicMock,
+    mock_render: MagicMock,
+    mock_get_detector: MagicMock,
+    mock_load: MagicMock,
+) -> None:
+    mock_load.return_value = (np.zeros(32000, dtype=np.float32), 16000)
+    mock_detector = MagicMock()
+    mock_detector.predict_waveform.return_value = {"label": "synthetic", "probability_synthetic": 0.88}
+    mock_get_detector.return_value = mock_detector
+    mock_render.return_value = "data/processed/overlays/sample_overlay.png"
+    mock_attribution.return_value = (
+        np.array([0.85, 0.90, 0.88]),
+        np.array([0.0, 0.75, 1.5]),
+    )
+
+    img, status, expl = generate_overlay("sample.wav")
+    assert img == "data/processed/overlays/sample_overlay.png"
+    assert "Overlay generated from: <code>sample.wav</code>" in status
+    assert "Attribution Analysis" in expl
+    assert "classified as synthetic" in expl
+    assert "average synthetic-likelihood of 88%" in expl
+
