@@ -26,6 +26,7 @@ from voxguard.explain import (
     render_explainability_overlay,
     windowed_attribution,
 )
+from voxguard.features.prosody import ProsodyFeatureExtractor
 from voxguard.fusion.fuse import fuse_risk_with_context
 from voxguard.fusion.redflags import scan_for_redflags
 from voxguard.fusion.transcribe import LiveTranscriber
@@ -505,12 +506,12 @@ _HEAD_HTML = """
 # ---------------------------------------------------------------------------
 # Module-level globals — audited (Phase 6, Prompt 6.2): these hold only
 # process-wide, read-only/shared resources, never per-session mutable state.
-#   - _DETECTOR / _SPEAKER_EMBEDDER / _TRANSCRIBER: lazily-built model
-#     instances. Expensive to load and stateless once built (inference does
-#     not mutate them), so sharing one instance across every session is
-#     correct and is what Gradio's own docs recommend — the alternative
-#     (reloading the ensemble/whisper model per gr.State) would make every
-#     session pay multi-second load latency for no isolation benefit.
+#   - _DETECTOR / _SPEAKER_EMBEDDER / _TRANSCRIBER / _PROSODY_EXTRACTOR:
+#     lazily-built model/extractor instances. Expensive to load and
+#     stateless once built (inference does not mutate them), so sharing one
+#     instance across every session is correct and is what Gradio's own
+#     docs recommend — the alternative (reloading per gr.State) would make
+#     every session pay load latency for no isolation benefit.
 #   - _SESSION_LOGGER: an append-only audit log for the whole process, not
 #     per-user data.
 # Every value that actually varies per user/session — the streaming
@@ -521,6 +522,7 @@ _HEAD_HTML = """
 _DETECTOR: WeightedAverageDetector | None = None
 _SPEAKER_EMBEDDER: SpeakerEmbedder | None = None
 _TRANSCRIBER: LiveTranscriber | None = None
+_PROSODY_EXTRACTOR: ProsodyFeatureExtractor | None = None
 _SESSION_LOGGER = SessionLogger()
 _SESSION_LOGGER.purge_older_than(30)
 
@@ -822,6 +824,79 @@ def _render_attribution_explanation_html(text: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Prosody feature display (Phase 2) — informational only.
+#
+# IMPORTANT: this panel exists purely for transparency into what Phase 2
+# evaluated. The shipped production detector (get_detector()) does NOT use
+# these features — its classifiers are both input_dim=768 (embedding-only);
+# Phase 2's own comparison found the 778-dim prosody-augmented classifier
+# did not beat the embedding-only baseline on EER (see
+# models/reports/decision_notes.md). Nothing computed here feeds into any
+# risk score, band, or fusion calculation anywhere else in this file.
+# ---------------------------------------------------------------------------
+
+_PROSODY_FEATURE_DISPLAY: dict[str, tuple[str, str, str]] = {
+    # name -> (icon, human label, unit suffix)
+    "f0_mean_hz": ("graphic_eq", "F0 Mean", "Hz"),
+    "f0_std_hz": ("show_chart", "F0 Std. Dev.", "Hz"),
+    "f0_range_hz": ("height", "F0 Range", "Hz"),
+    "voiced_fraction": ("record_voice_over", "Voiced Fraction", ""),
+    "f0_jitter_hz": ("waves", "F0 Jitter", "Hz"),
+    "pause_ratio": ("pause_circle", "Pause Ratio", ""),
+    "speaking_rate_onsets_per_sec": ("speed", "Speaking Rate", "onsets/s"),
+    "rms_mean": ("volume_up", "RMS Energy Mean", ""),
+    "rms_std": ("equalizer", "RMS Energy Std. Dev.", ""),
+    "zcr_mean": ("bar_chart", "Zero-Crossing Rate", ""),
+}
+
+
+def _render_prosody_html(features: np.ndarray) -> str:
+    """Renders a ProsodyFeatureExtractor vector as a labeled, read-only card."""
+    rows = []
+    for name, value in zip(ProsodyFeatureExtractor.FEATURE_NAMES, features):
+        icon, label, unit = _PROSODY_FEATURE_DISPLAY.get(name, ("analytics", name, ""))
+        rows.append(
+            '<div style="display:flex; justify-content:space-between; align-items:center; '
+            'padding:6px 0; border-bottom:1px solid rgba(148,163,184,0.12);">'
+            '<span style="display:flex; align-items:center; gap:6px; color:#94a3b8; font-size:0.85em;">'
+            f'<span class="material-symbols-outlined" style="font-size:15px; color:#22d3ee;">{icon}</span>'
+            f'{label}</span>'
+            f'<span style="font-family:var(--vg-mono); color:#e6edf5; font-weight:600;">'
+            f'{float(value):.4f}{(" " + unit) if unit else ""}</span>'
+            '</div>'
+        )
+    grid_html = "".join(rows)
+
+    return (
+        '<div class="vg-card" style="background:rgba(15,30,48,0.65); color:#bae6fd; '
+        'border:1px solid rgba(34,211,238,0.28); border-radius:10px; padding:14px 18px; '
+        'margin:8px 0; font-size:0.92em;">'
+        '<div style="margin-bottom:6px; font-weight:700; color:#67e8f9; font-size:0.8em; '
+        'text-transform:uppercase; letter-spacing:0.08em; font-family:var(--vg-mono); '
+        'display:flex; align-items:center; gap:6px;">'
+        '<span class="material-symbols-outlined" style="font-size:16px; color:#22d3ee;">graphic_eq</span>'
+        'Prosody Feature Vector (Phase 2)</div>'
+        '<p style="margin:0 0 10px 0; font-size:0.8em; color:#94a3b8; font-style:italic; line-height:1.5;">'
+        "Informational only — these 10 handcrafted features are NOT used by the "
+        "shipped detector's risk score. Phase 2 found the embedding-only classifier "
+        "had lower EER, so production scoring uses embeddings alone "
+        "(see <code>models/reports/decision_notes.md</code>)."
+        "</p>"
+        f'{grid_html}'
+        '</div>'
+    )
+
+
+def _prosody_placeholder_html(message: str) -> str:
+    """Renders a neutral placeholder for the prosody panel."""
+    return (
+        f'<p style="color:#94a3b8; font-style:italic; font-size:0.92em; '
+        f'display:flex; align-items:center; gap:6px;">'
+        f'<span class="material-symbols-outlined" style="font-size:16px; color:#64748b;">info</span>'
+        f'{message}</p>'
+    )
+
 
 # ---------------------------------------------------------------------------
 # Prevention prompt rendering
@@ -990,11 +1065,41 @@ def get_speaker_embedder() -> SpeakerEmbedder:
 
 
 def get_transcriber() -> LiveTranscriber:
-    """Lazy-initializes and returns the shared LiveTranscriber instance."""
+    """Lazy-initializes and returns the shared LiveTranscriber instance.
+
+    Pins language="hi" rather than using LiveTranscriber's default
+    auto-detection. This project's audio is always Hindi/Hinglish or
+    English, but Whisper's language-ID step can still fail badly on
+    synthetic/cloned audio, whose acoustic artifacts fall outside its
+    training distribution — confirmed directly: on a cloned test clip,
+    auto-detect landed on Bengali at 35% confidence (near a coin-flip
+    between several low-resource-language guesses), decoding the whole
+    clip as gibberish in the wrong script. Forcing "hi" removes that
+    failure mode entirely, since the target language is always known here
+    — Whisper's Hindi mode still handles the English words in code-switched
+    Hinglish reasonably (as seen on real clips), it just no longer risks
+    guessing a completely unrelated language on low-confidence audio.
+    """
     global _TRANSCRIBER
     if _TRANSCRIBER is None:
-        _TRANSCRIBER = LiveTranscriber(model_size="base")
+        _TRANSCRIBER = LiveTranscriber(model_size="base", language="hi")
     return _TRANSCRIBER
+
+
+def get_prosody_extractor() -> ProsodyFeatureExtractor:
+    """Lazy-initializes and returns the shared ProsodyFeatureExtractor instance.
+
+    Informational only — see compute_prosody_features() below. Its output is
+    never fed into get_detector()'s risk score: Phase 2 evaluated a
+    prosody-augmented classifier and found the embedding-only baseline had
+    lower EER, so the shipped detector (wav2vec2_hindi_combined_logreg +
+    wavlm_hindi_combined_logreg, both input_dim=768) uses embeddings alone.
+    See models/reports/decision_notes.md for that comparison.
+    """
+    global _PROSODY_EXTRACTOR
+    if _PROSODY_EXTRACTOR is None:
+        _PROSODY_EXTRACTOR = ProsodyFeatureExtractor()
+    return _PROSODY_EXTRACTOR
 
 
 def create_session(sample_rate: int | None = None) -> StreamingSession:
@@ -1426,6 +1531,57 @@ def generate_overlay(audio_path: str | None) -> tuple[str | None, str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Prosody feature extraction callback (Phase 2, informational display)
+# ---------------------------------------------------------------------------
+
+
+def compute_prosody_features(audio_path: str | None) -> str:
+    """Extracts and renders the Phase 2 prosody feature vector for a clip.
+
+    Parameters
+    ----------
+    audio_path:
+        File path of the audio to analyze. Comes from ``last_audio_state``
+        (the path stored by ``analyze_uploaded_file`` on its last run) —
+        same source the Explainability Overlay button reads from, so this
+        panel always reflects the currently-analyzed clip.
+
+    Returns
+    -------
+    status_or_result_html : str
+        Either a placeholder/error message, or the rendered 10-value
+        feature card.
+
+    Note
+    ----
+    Display-only: this function's output never feeds into ``get_detector()``
+    or any fusion/risk calculation. See the module note above
+    ``_render_prosody_html`` for why.
+    """
+    if audio_path is None:
+        return _prosody_placeholder_html(
+            "Analyze a clip first, then click Extract Prosody Features."
+        )
+
+    try:
+        waveform, sr = load_audio(audio_path, target_sr=16_000)
+    except Exception as exc:
+        logger.warning("compute_prosody_features: failed to load '%s': %s", audio_path, exc)
+        return f'<p style="color:#fca5a5;">Could not load audio: {exc}</p>'
+
+    try:
+        extractor = get_prosody_extractor()
+        features = extractor.extract(waveform, sr)
+        return _render_prosody_html(features)
+    except Exception as exc:
+        logger.exception("compute_prosody_features failed for '%s'", audio_path)
+        return (
+            f'<p style="color:#fca5a5;">Prosody extraction failed: '
+            f"<code>{type(exc).__name__}: {exc}</code></p>"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Voiceprint Verification tab callbacks
 # ---------------------------------------------------------------------------
 
@@ -1829,6 +1985,30 @@ def build_app() -> gr.Blocks:
                     )
                     gr.Markdown(_OVERLAY_CAPTION)
 
+                # ---- Prosody feature analysis (Phase 2, informational) ----
+                with gr.Accordion(
+                    "Prosody Feature Analysis (Informational)", open=False, elem_classes=["vg-panel"]
+                ):
+                    gr.HTML(
+                        '<div class="vg-section-title">'
+                        '<span class="material-symbols-outlined vg-sec-icon">graphic_eq</span>'
+                        "Handcrafted Prosody Features</div>"
+                    )
+                    gr.Markdown(
+                        "Extracts the 10 handcrafted prosody/energy features (F0 statistics, "
+                        "jitter, pause ratio, speaking rate, energy, zero-crossing rate) that "
+                        "Phase 2 evaluated as an addition to the embedding classifier. "
+                        "**Display only — the shipped detector does not use these values.** "
+                        "Phase 2's comparison found the embedding-only classifier had lower "
+                        "EER, so production risk scoring above is unaffected by this panel."
+                    )
+                    prosody_btn = gr.Button("Extract Prosody Features", variant="secondary")
+                    prosody_output = gr.HTML(
+                        value=_prosody_placeholder_html(
+                            "Analyze a clip above, then click Extract Prosody Features."
+                        )
+                    )
+
                 analyze_btn.click(
                     fn=analyze_uploaded_file,
                     inputs=[
@@ -1850,6 +2030,12 @@ def build_app() -> gr.Blocks:
                     fn=generate_overlay,
                     inputs=[last_audio_state],
                     outputs=[overlay_image, overlay_status, overlay_explanation],
+                )
+
+                prosody_btn.click(
+                    fn=compute_prosody_features,
+                    inputs=[last_audio_state],
+                    outputs=[prosody_output],
                 )
 
             # ================================================================
