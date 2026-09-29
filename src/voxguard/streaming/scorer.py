@@ -6,6 +6,11 @@ from typing import Any
 
 import numpy as np
 
+# RMS energy below which a chunk is treated as silence and never scored.
+# Shared with voxguard.utils.chunk_audio so training chunks are gated
+# identically to inference chunks.
+SILENCE_RMS_THRESHOLD: float = 0.01
+
 
 class StreamingScorer:
     """Wraps a detector and scores in-memory audio chunks safely.
@@ -14,7 +19,7 @@ class StreamingScorer:
     return a mapping containing ``"probability_synthetic"`` and ``"label"``.
     """
 
-    def __init__(self, detector: Any, silence_threshold: float = 0.01) -> None:
+    def __init__(self, detector: Any, silence_threshold: float = SILENCE_RMS_THRESHOLD) -> None:
         if not hasattr(detector, "predict_waveform"):
             raise TypeError(
                 "StreamingScorer requires a detector with a predict_waveform(waveform, sr) method."

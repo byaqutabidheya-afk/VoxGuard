@@ -11,7 +11,7 @@ the (expensive) backbone forward pass.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -33,6 +33,92 @@ def _resolve_audio_path(path_str: str) -> Path:
     """
     p = Path(str(path_str))
     return p if p.is_absolute() else (config.BASE_DIR / p)
+
+
+def embed_length_sorted(
+    durations: np.ndarray,
+    load_waveform: Callable[[int], np.ndarray],
+    extractor: EmbeddingExtractor,
+    batch_size: int = 16,
+    log_progress: bool = True,
+) -> np.ndarray:
+    """Embeds items in batches of similar duration; returns rows in the caller's order.
+
+    This is the single batching path for every embedding cache (whole-clip
+    via ``extract_and_cache``, chunk-level via
+    ``scripts/extract_chunked_embeddings.py``).
+
+    Parameters
+    ----------
+    durations:
+        Duration (seconds) of each item, used only to order the batches.
+    load_waveform:
+        ``load_waveform(i)`` returns item *i*'s waveform at
+        ``config.SAMPLE_RATE``. Called lazily, one batch at a time, so the
+        whole dataset never needs to be in memory.
+    extractor:
+        A loaded ``EmbeddingExtractor``.
+    batch_size:
+        Items per ``extractor.extract_batch`` call.
+    log_progress:
+        Log every 10 batches and on completion.
+
+    Returns
+    -------
+    np.ndarray, shape ``(len(durations), hidden_size)``
+        Row *i* is item *i*'s embedding, regardless of batching order.
+    """
+    durations = np.asarray(durations, dtype=np.float64)
+    n_rows = len(durations)
+    if n_rows == 0:
+        raise ValueError("Cannot embed an empty set of items.")
+    n_batches = (n_rows + batch_size - 1) // batch_size
+
+    # Batch clips of similar duration together. wav2vec2/WavLM mix the zero
+    # padding into the valid frames via the positional convolution (kernel
+    # 128) and the transformer that follows it, so a batch holding a 1s clip
+    # next to a 9s clip corrupts the short clip's embedding badly — measured
+    # at mean cosine 0.69 vs. unbatched extraction on real ASVspoof clips,
+    # with 78% of clips below 0.9. Sorting by duration first keeps padding
+    # within a batch near zero (mean cosine 0.95). Header-only duration reads
+    # are cheap relative to the forward passes they protect.
+    order = np.argsort(durations, kind="stable")
+    if log_progress:
+        logger.info(
+            "Duration range: %.2fs - %.2fs (median %.2fs), %d batches",
+            durations.min(),
+            durations.max(),
+            float(np.median(durations)),
+            n_batches,
+        )
+
+    embeddings: Optional[np.ndarray] = None
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_size
+        # Positions into the caller's row order, grouped by similar duration.
+        batch_positions = order[start : start + batch_size]
+
+        waveforms = [load_waveform(int(i)) for i in batch_positions]
+        batch_embeddings = extractor.extract_batch(waveforms)
+
+        if embeddings is None:
+            embeddings = np.zeros(
+                (n_rows, batch_embeddings.shape[1]), dtype=batch_embeddings.dtype
+            )
+        # Scatter back to the caller's row order so saved matrices stay
+        # aligned with their manifest CSV.
+        embeddings[batch_positions] = batch_embeddings
+
+        if log_progress and ((batch_idx + 1) % 10 == 0 or (batch_idx + 1) == n_batches):
+            logger.info(
+                "Progress: batch [%d/%d] (%d/%d items embedded)",
+                batch_idx + 1,
+                n_batches,
+                min(start + batch_size, n_rows),
+                n_rows,
+            )
+
+    return embeddings
 
 
 def extract_and_cache(
@@ -108,64 +194,24 @@ def extract_and_cache(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    n_batches = (n_rows + batch_size - 1) // batch_size
     logger.info(
-        "Extracting embeddings for %d files in %d batches (batch_size=%d) using %r",
+        "Extracting embeddings for %d files (batch_size=%d) using %r",
         n_rows,
-        n_batches,
         batch_size,
         extractor,
     )
-
-    # Batch clips of similar duration together. wav2vec2/WavLM mix the zero
-    # padding into the valid frames via the positional convolution (kernel
-    # 128) and the transformer that follows it, so a batch holding a 1s clip
-    # next to a 9s clip corrupts the short clip's embedding badly — measured
-    # at mean cosine 0.69 vs. unbatched extraction on real ASVspoof clips,
-    # with 78% of clips below 0.9. Sorting by duration first keeps padding
-    # within a batch near zero (mean cosine 0.95). Header-only duration reads
-    # are cheap relative to the forward passes they protect.
     logger.info("Reading audio durations to build length-sorted batches...")
     durations = np.array(
         [get_duration_seconds(_resolve_audio_path(p)) for p in df[path_col]],
         dtype=np.float64,
     )
-    order = np.argsort(durations, kind="stable")
-    logger.info(
-        "Duration range: %.2fs - %.2fs (median %.2fs)",
-        durations.min(),
-        durations.max(),
-        float(np.median(durations)),
+    paths = df[path_col].tolist()
+    embeddings = embed_length_sorted(
+        durations,
+        lambda i: load_audio(_resolve_audio_path(paths[i]), target_sr=config.SAMPLE_RATE)[0],
+        extractor,
+        batch_size=batch_size,
     )
-
-    embeddings: Optional[np.ndarray] = None
-    for batch_idx in range(n_batches):
-        start = batch_idx * batch_size
-        # Positions into the caller's row order, grouped by similar duration.
-        batch_positions = order[start : start + batch_size]
-
-        waveforms = [
-            load_audio(_resolve_audio_path(p), target_sr=config.SAMPLE_RATE)[0]
-            for p in df[path_col].iloc[batch_positions]
-        ]
-        batch_embeddings = extractor.extract_batch(waveforms)
-
-        if embeddings is None:
-            embeddings = np.zeros(
-                (n_rows, batch_embeddings.shape[1]), dtype=batch_embeddings.dtype
-            )
-        # Scatter back to the caller's row order so the .npy stays aligned
-        # with the manifest CSV written below.
-        embeddings[batch_positions] = batch_embeddings
-
-        if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == n_batches:
-            logger.info(
-                "Progress: batch [%d/%d] (%d/%d files embedded)",
-                batch_idx + 1,
-                n_batches,
-                min(start + batch_size, n_rows),
-                n_rows,
-            )
 
     np.save(output_path, embeddings)
 
