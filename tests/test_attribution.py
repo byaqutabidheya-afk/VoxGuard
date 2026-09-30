@@ -376,27 +376,26 @@ def test_detector_none_uses_chunked_default_detector(monkeypatch) -> None:
     assert np.allclose(scores, 0.3)
 
 
-def test_default_detector_is_built_from_production_streaming_config(monkeypatch) -> None:
-    """get_default_detector wires the paths and weight from config, not from hardcoded literals."""
+def test_default_detector_is_the_shared_streaming_production_detector(monkeypatch) -> None:
+    """get_default_detector goes through build_production_detector("streaming"), once, shared process-wide."""
     import voxguard.classifier.ensemble as ensemble
     import voxguard.explain.attribution as attribution
-    from voxguard import config
 
-    captured = {}
+    built = []
 
-    class _FakeDetector:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
+    def fake_build(mode="wholeclip"):
+        built.append(mode)
+        return object()
 
-    monkeypatch.setattr(ensemble, "WeightedAverageDetector", _FakeDetector)
-    attribution.get_default_detector.cache_clear()
+    monkeypatch.setattr(ensemble, "build_production_detector", fake_build)
+    ensemble.get_production_detector.cache_clear()
     try:
-        attribution.get_default_detector()
+        first = attribution.get_default_detector()
+        second = attribution.get_default_detector()
     finally:
-        attribution.get_default_detector.cache_clear()
-    assert captured["wav2vec2_classifier_path"] == config.BASE_DIR / config.PRODUCTION_STREAMING_CLASSIFIERS["wav2vec2"]
-    assert captured["wavlm_classifier_path"] == config.BASE_DIR / config.PRODUCTION_STREAMING_CLASSIFIERS["wavlm"]
-    assert captured["weight_a"] == config.PRODUCTION_ENSEMBLE_WEIGHT_A
+        ensemble.get_production_detector.cache_clear()
+    assert built == ["streaming"]          # streaming family, built exactly once
+    assert first is second
 
 
 class _Capture:

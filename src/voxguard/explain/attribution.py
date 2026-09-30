@@ -62,7 +62,6 @@ Usage example::
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any, Optional
 
 import numpy as np
@@ -81,21 +80,15 @@ _SILENCE_THRESHOLD: float = 0.01
 DEFAULT_STRIDE_SECONDS: float = 0.75
 
 
-@lru_cache(maxsize=1)
 def get_default_detector() -> Any:
-    """Shared ``WeightedAverageDetector`` on ``config.PRODUCTION_STREAMING_CLASSIFIERS``.
+    """The shared chunk-native STREAMING production detector (``build_production_detector("streaming")``).
 
-    Built lazily (it loads both SSL backbones) and cached for the process. Weight is
-    ``config.PRODUCTION_ENSEMBLE_WEIGHT_A``.
+    Built lazily (it loads both SSL backbones) and shared process-wide with ``StreamingSession``'s default
+    detector; heads from ``config.PRODUCTION_STREAMING_CLASSIFIERS``, weight ``config.PRODUCTION_ENSEMBLE_WEIGHT_A``.
     """
-    from voxguard.classifier.ensemble import WeightedAverageDetector
+    from voxguard.classifier.ensemble import get_production_detector   # lazy: keeps this module import-light
 
-    paths = {b: config.BASE_DIR / p for b, p in config.PRODUCTION_STREAMING_CLASSIFIERS.items()}
-    return WeightedAverageDetector(
-        wav2vec2_classifier_path=paths["wav2vec2"],
-        wavlm_classifier_path=paths["wavlm"],
-        weight_a=config.PRODUCTION_ENSEMBLE_WEIGHT_A,
-    )
+    return get_production_detector("streaming")
 
 
 def windowed_attribution(

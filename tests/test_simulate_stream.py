@@ -95,7 +95,7 @@ def test_simulate_stream_empty_audio() -> None:
 def test_simulate_stream_cli_execution(sample_wav: Path, capsys) -> None:
     """Tests simulate_stream CLI execution with mock detector and command line arguments."""
     with patch(
-        "voxguard.streaming.session.WeightedAverageDetector",
+        "voxguard.streaming.session.get_production_detector",
         return_value=_DummyDetector(score=0.85),
     ):
         with patch(
@@ -122,3 +122,16 @@ def test_simulate_stream_cli_execution(sample_wav: Path, capsys) -> None:
     assert "Total Duration Processed: 3.00s" in captured
     assert "Synthetic Flag Triggered: True" in captured
     assert "Time to First Flag:" in captured
+
+
+def test_simulate_stream_cli_defaults_come_from_config(sample_wav: Path, capsys) -> None:
+    """With no --consecutive_* flags the CLI uses the calibrated config rule, not the session's legacy defaults."""
+    with patch(
+        "voxguard.streaming.session.get_production_detector",
+        return_value=_DummyDetector(score=0.85),
+    ) as get_det:
+        with patch("sys.argv", ["simulate_stream.py", "--audio_path", str(sample_wav), "--no_sleep"]):
+            main()
+    get_det.assert_called_once_with("streaming")          # CLI streams: chunk-native family
+    out = capsys.readouterr().out
+    assert f"Consecutive Req:  {config.STREAM_CONSECUTIVE_FLAGS_REQUIRED} {config.STREAM_CONSECUTIVE_UNIT}" in out

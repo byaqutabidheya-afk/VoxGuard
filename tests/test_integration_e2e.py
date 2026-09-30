@@ -21,12 +21,12 @@ Phase 2/3 note: this project's Phase 2 decision
 prosody branch to exercise here. That decision is a fact about this
 project's classifier, not something this test re-derives.
 
-Detector configuration: the fixtures below use
-wav2vec2_hindi_combined_logreg + wavlm_hindi_combined_logreg — the exact
-production configuration used by both app.app.get_detector() and
-StreamingSession's own default detector — so "whole-clip", "streaming",
-and "explainability overlay" below all exercise the one detector instance
-actually shipped, not a stand-in.
+Detector configuration: the fixtures below come from build_production_detector,
+the same factory the app and API use. The whole-clip tests use the "wholeclip"
+detector (as app.app.get_detector() and api.main do); the streaming simulation
+uses the "streaming" (chunk-native) detector that StreamingSession defaults to,
+with the calibrated flag rule from config; the explainability overlay takes its
+own default (also "streaming"). No test names a classifier path.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import numpy as np
 import pytest
 
 from voxguard import config
-from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.classifier.ensemble import WeightedAverageDetector, build_production_detector
 from voxguard.explain import describe_attribution, render_explainability_overlay, windowed_attribution
 from voxguard.fusion.fuse import fuse_risk_with_context
 from voxguard.fusion.redflags import scan_for_redflags
@@ -69,9 +69,6 @@ _CANONICAL_ENROLLMENT_CLIPS = [
     Path("data/raw/hindi_hinglish/real/byaquta_scam_11.wav"),
 ]
 
-_PRODUCTION_WAV2VEC2_CLASSIFIER = "models/classifiers/wav2vec2_hindi_combined_logreg.joblib"
-_PRODUCTION_WAVLM_CLASSIFIER = "models/classifiers/wavlm_hindi_combined_logreg.joblib"
-
 
 def _ensure_byaquta_enrolled(embedder: SpeakerEmbedder) -> None:
     """Re-enrolls ENROLLED_NAME from its canonical clips if not already enrolled.
@@ -99,11 +96,14 @@ def _ensure_byaquta_enrolled(embedder: SpeakerEmbedder) -> None:
 
 @pytest.fixture(scope="module")
 def detector() -> WeightedAverageDetector:
-    """The production detector configuration (mirrors app.app.get_detector())."""
-    return WeightedAverageDetector(
-        wav2vec2_classifier_path=_PRODUCTION_WAV2VEC2_CLASSIFIER,
-        wavlm_classifier_path=_PRODUCTION_WAVLM_CLASSIFIER,
-    )
+    """The WHOLE-CLIP production detector (what app.app.get_detector() and api.main use)."""
+    return build_production_detector("wholeclip")
+
+
+@pytest.fixture(scope="module")
+def streaming_detector() -> WeightedAverageDetector:
+    """The chunk-native STREAMING production detector (StreamingSession's default)."""
+    return build_production_detector("streaming")
 
 
 @pytest.fixture(scope="module")
@@ -141,9 +141,14 @@ def test_whole_clip_detection(detector, sample_waveform):
 # Phase 5 — streaming simulation with flag timing
 # ---------------------------------------------------------------------------
 
-def test_streaming_simulation(detector, sample_waveform):
+def test_streaming_simulation(streaming_detector, sample_waveform):
     waveform, sr = sample_waveform
-    session = StreamingSession(detector=detector, sample_rate=sr)
+    session = StreamingSession(
+        detector=streaming_detector,
+        sample_rate=sr,
+        consecutive_flags_required=config.STREAM_CONSECUTIVE_FLAGS_REQUIRED,
+        consecutive_unit=config.STREAM_CONSECUTIVE_UNIT,
+    )
     summary = simulate_stream(audio=waveform, session=session, real_time_paced=False, sr=sr)
 
     assert isinstance(summary, dict)
@@ -287,15 +292,17 @@ def test_explainability_overlay(detector, sample_waveform, tmp_path):
     waveform, sr = sample_waveform
     out_path = tmp_path / "integration_overlay.png"
 
+    # Overlay and attribution take their own default: the chunk-native streaming detector on
+    # config.STREAM_CHUNK_SECONDS windows. `detector` (whole-clip) is used only for the clip-level label below.
     saved_path = render_explainability_overlay(
-        waveform=waveform, sr=sr, detector=detector, output_path=out_path,
+        waveform=waveform, sr=sr, output_path=out_path,
     )
     saved = Path(saved_path)
     assert saved.exists()
     assert saved.suffix == ".png"
     assert saved.stat().st_size > 0
 
-    scores, timestamps = windowed_attribution(waveform=waveform, sr=sr, detector=detector)
+    scores, timestamps = windowed_attribution(waveform=waveform, sr=sr)
     assert isinstance(scores, np.ndarray)
     assert isinstance(timestamps, np.ndarray)
     assert scores.shape == timestamps.shape

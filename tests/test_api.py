@@ -296,3 +296,40 @@ def test_real_clip_end_to_end_analyze(client: TestClient) -> None:
     assert "label" in data
     assert 0.0 <= data["probability_synthetic"] <= 1.0
     assert data["risk_band"] in ("low", "medium", "high", "inconclusive")
+
+
+def test_get_detector_is_the_wholeclip_production_detector() -> None:
+    import api.main as api_main
+
+    api_main._DETECTOR = None
+    try:
+        with patch("api.main.build_production_detector") as mock_build:
+            mock_build.return_value = MagicMock()
+            assert api_main.get_detector() is mock_build.return_value
+            assert api_main.get_detector() is mock_build.return_value     # built once
+            mock_build.assert_called_once_with("wholeclip")
+    finally:
+        api_main._DETECTOR = None
+
+
+def test_lifespan_verifies_once_and_loads_only_the_wholeclip_detector() -> None:
+    """Startup: verify the production files once, load the whole-clip detector; never the streaming one."""
+    with (
+        patch("api.main.verify_production_classifiers") as mock_verify,
+        patch("api.main.get_detector") as mock_get_det,
+        patch("api.main.get_speaker_embedder"),
+        patch("api.main.get_transcriber"),
+        patch("voxguard.classifier.ensemble.get_production_detector") as mock_streaming,
+    ):
+        with TestClient(app):
+            pass
+    mock_verify.assert_called_once_with()
+    mock_get_det.assert_called_once_with()
+    mock_streaming.assert_not_called()
+
+
+def test_lifespan_fails_loudly_when_a_production_file_is_missing() -> None:
+    with patch("api.main.verify_production_classifiers", side_effect=FileNotFoundError("missing: y.joblib")):
+        with pytest.raises(FileNotFoundError, match="y.joblib"):
+            with TestClient(app):
+                pass

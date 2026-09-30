@@ -56,8 +56,16 @@ def main() -> None:
     parser.add_argument(
         "--consecutive_flags_required",
         type=int,
-        default=3,
-        help="Number of consecutive above-threshold pushes required to trigger a flag (default: 3).",
+        default=None,
+        help=f"Consecutive above-threshold decisions required to trigger a flag "
+             f"(default: {config.STREAM_CONSECUTIVE_FLAGS_REQUIRED} from config).",
+    )
+    parser.add_argument(
+        "--consecutive_unit",
+        choices=["pushes", "updates"],
+        default=None,
+        help=f"What one decision is: a push_audio call ('pushes') or a per-stride score update ('updates') "
+             f"(default: {config.STREAM_CONSECUTIVE_UNIT} from config, the unit the flag rule was calibrated with).",
     )
     parser.add_argument(
         "--step_seconds",
@@ -85,12 +93,18 @@ def main() -> None:
         logger.error("Audio file does not exist: %s", audio_path)
         sys.exit(1)
 
-    # Instantiate session honoring the 'None defers to config default' pattern
+    # Instantiate session honoring the 'None defers to config default' pattern. The detector is left to
+    # StreamingSession's default: the shared chunk-native STREAMING production detector.
     session = StreamingSession(
         chunk_seconds=args.chunk_seconds,
         overlap_seconds=args.overlap_seconds,
         flag_threshold=args.flag_threshold,
-        consecutive_flags_required=args.consecutive_flags_required,
+        consecutive_flags_required=(
+            config.STREAM_CONSECUTIVE_FLAGS_REQUIRED
+            if args.consecutive_flags_required is None
+            else args.consecutive_flags_required
+        ),
+        consecutive_unit=config.STREAM_CONSECUTIVE_UNIT if args.consecutive_unit is None else args.consecutive_unit,
     )
 
     chunk_sec_display = (
@@ -120,7 +134,7 @@ def main() -> None:
     print(f" Chunk Size:       {chunk_sec_display:.2f}s")
     print(f" Overlap Size:     {overlap_sec_display:.2f}s")
     print(f" Flag Threshold:   {flag_thresh_display:.2f}")
-    print(f" Consecutive Req:  {session.consecutive_flags_required} frames")
+    print(f" Consecutive Req:  {session.consecutive_flags_required} {session.consecutive_unit}")
     print(f" Feed Step Size:   {args.step_seconds * 1000:.0f}ms increments")
     print(f" Real-time Pacing: {'Enabled (time.sleep paced)' if realtime_pacing else 'Disabled (fast processing)'}")
     print("-" * 70)

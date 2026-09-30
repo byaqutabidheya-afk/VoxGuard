@@ -8,7 +8,7 @@ from typing import Any, Callable
 import numpy as np
 
 from voxguard import config
-from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.classifier.ensemble import get_production_detector
 from voxguard.streaming.buffer import StreamingBuffer
 from voxguard.streaming.ema import RunningRiskScore
 from voxguard.streaming.scorer import StreamingScorer
@@ -50,10 +50,12 @@ class StreamingSession:
                 f"consecutive_unit must be one of {CONSECUTIVE_UNITS}; got {consecutive_unit!r}."
             )
         self.consecutive_unit = consecutive_unit
-        self.detector = detector or WeightedAverageDetector(
-            wav2vec2_classifier_path="models/classifiers/wav2vec2_hindi_combined_logreg.joblib",
-            wavlm_classifier_path="models/classifiers/wavlm_hindi_combined_logreg.joblib",
-        )
+        # Default: the shared chunk-native STREAMING detector (config.PRODUCTION_STREAMING_CLASSIFIERS): a
+        # streaming session scores fixed-length windows, which is what those heads were trained on.
+        # NOTE: consecutive_flags_required / consecutive_unit keep their original defaults (3 / "pushes") for
+        # backward compatibility. Production callers must pass config.STREAM_CONSECUTIVE_FLAGS_REQUIRED and
+        # config.STREAM_CONSECUTIVE_UNIT: the F4 calibration was measured with per-score-update counting.
+        self.detector = detector or get_production_detector("streaming")
         self._initial_sample_rate = int(sample_rate) if sample_rate is not None else None
         self.sample_rate = self._initial_sample_rate
         self.chunk_seconds = chunk_seconds

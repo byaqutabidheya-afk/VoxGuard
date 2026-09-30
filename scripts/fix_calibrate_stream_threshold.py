@@ -71,7 +71,7 @@ import numpy as np
 import pandas as pd
 
 from voxguard import config
-from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.classifier.ensemble import WeightedAverageDetector, build_production_detector
 from voxguard.streaming.scorer import StreamingScorer
 from voxguard.streaming.session import StreamingSession, simulate_stream
 from voxguard.utils.audio_io import load_audio
@@ -170,14 +170,10 @@ def resolve_clips() -> List[Dict[str, Any]]:
 def build_detector() -> WeightedAverageDetector:
     """Detector wired to config.PRODUCTION_STREAMING_CLASSIFIERS (verified after construction)."""
     paths = {b: config.BASE_DIR / p for b, p in config.PRODUCTION_STREAMING_CLASSIFIERS.items()}
-    for p in paths.values():
-        if not p.exists():
-            raise ReplayError(f"Streaming classifier not found: {p}")
-    detector = WeightedAverageDetector(
-        wav2vec2_classifier_path=paths["wav2vec2"],
-        wavlm_classifier_path=paths["wavlm"],
-        weight_a=config.PRODUCTION_ENSEMBLE_WEIGHT_A,
-    )
+    try:
+        detector = build_production_detector("streaming")     # also checks that every head file exists
+    except FileNotFoundError as exc:
+        raise ReplayError(str(exc)) from exc
     wired = (detector.detector_a.classifier_path.resolve(), detector.detector_b.classifier_path.resolve())
     if wired != (paths["wav2vec2"].resolve(), paths["wavlm"].resolve()):
         raise ReplayError(f"Detector is not wired to the production streaming heads: {wired}")

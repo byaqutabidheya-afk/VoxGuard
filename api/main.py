@@ -32,7 +32,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.classifier.ensemble import (
+    WeightedAverageDetector,
+    build_production_detector,
+    verify_production_classifiers,
+)
 from voxguard.fusion.fuse import fuse_risk_with_context
 from voxguard.fusion.redflags import scan_for_redflags
 from voxguard.fusion.transcribe import LiveTranscriber
@@ -77,14 +81,10 @@ _SESSION_LOGGER.purge_older_than(30)
 
 
 def get_detector() -> WeightedAverageDetector:
-    """Lazy-initializes and returns the shared production WeightedAverageDetector instance."""
+    """Lazy-initializes and returns the shared production WHOLE-CLIP WeightedAverageDetector instance."""
     global _DETECTOR
     if _DETECTOR is None:
-        _DETECTOR = WeightedAverageDetector(
-            wav2vec2_classifier_path="models/classifiers/wav2vec2_hindi_combined_logreg.joblib",
-            wavlm_classifier_path="models/classifiers/wavlm_hindi_combined_logreg.joblib",
-            threshold=0.6,
-        )
+        _DETECTOR = build_production_detector("wholeclip")
     return _DETECTOR
 
 
@@ -108,6 +108,10 @@ def get_transcriber() -> LiveTranscriber:
 async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager: pre-loads models once at startup."""
     logger.info("Initializing VoxGuard models for FastAPI service...")
+    verify_production_classifiers()   # once, at startup: a missing production file fails here, naming its path
+    # Whole-clip detector ONLY: /analyze and /analyze-context score complete uploaded files and there is no
+    # streaming endpoint, so the chunked (streaming) detector is deliberately NOT loaded (it would double startup time
+    # and memory for nothing) -- do not "fix" this omission unless a streaming endpoint is added.
     get_detector()
     get_speaker_embedder()
     get_transcriber()

@@ -21,7 +21,11 @@ import gradio as gr
 import numpy as np
 
 from voxguard import config
-from voxguard.classifier.ensemble import WeightedAverageDetector
+from voxguard.classifier.ensemble import (
+    WeightedAverageDetector,
+    build_production_detector,
+    verify_production_classifiers,
+)
 from voxguard.explain import (
     describe_attribution,
     render_explainability_overlay,
@@ -615,6 +619,7 @@ def _risk_html(
     keyword_score: float | None = None,
     transaction_multiplier: float | None = None,
     contact_multiplier: float | None = None,
+    model: str | None = None,
 ) -> str:
     """Return an HTML block showing the color-coded overall contextual call risk band.
 
@@ -643,6 +648,9 @@ def _risk_html(
         Multiplier from transaction context (e.g. 1.5 for fund transfer).
     contact_multiplier:
         Multiplier from voiceprint verification (0.9 match, 1.3 mismatch).
+    model:
+        Which model family produced this verdict, e.g. from ``_wholeclip_model_label()``. Shown as its own
+        line under the context label so a verdict is always traceable to the model that made it.
     """
     band = score_to_band(probability_synthetic)
     s = _BAND_STYLES[band]
@@ -699,10 +707,21 @@ def _risk_html(
         else ""
     )
 
+    model_line = (
+        f'<p style="margin:0 0 8px 0; font-size:0.78em; color:{s["muted"]}; background:transparent; '
+        f'font-family:var(--vg-mono); display:flex; align-items:center; gap:5px;">'
+        f'<span class="material-symbols-outlined" style="font-size:14px;">model_training</span>'
+        f"Model: {html.escape(model)}</p>"
+        if model
+        else ""
+    )
+
     # A "live" readout (streaming, still updating) gets a subtle continuous
     # pulse so it visually reads as an active signal, not a static result —
     # purely a CSS animation class, the score/label content is unchanged.
-    is_live = "live" in context.lower() or "streaming" in context.lower()
+    # Only the leading label counts: the model line and the rest of the context must not flip it.
+    context_label = context.split("·")[0].lower()
+    is_live = "live" in context_label or "streaming" in context_label
     card_class = "vg-card vg-card-live" if is_live else "vg-card"
 
     return (
@@ -716,6 +735,7 @@ def _risk_html(
         f"box-shadow:0 10px 30px -18px rgba(0,0,0,0.6); "
         f'margin:4px 0;">'
         f"{context_line}"
+        f"{model_line}"
         f'<p style="margin:0; font-size:1.35em; font-weight:800; '
         f"color:{s['text']}; background:transparent; letter-spacing:0.02em; "
         f'display:flex; align-items:center; gap:8px;\">'
@@ -1048,13 +1068,15 @@ def _format_clip_list(clips: list[str]) -> str:
 
 
 def get_detector() -> WeightedAverageDetector:
-    """Lazy-initializes and returns the shared WeightedAverageDetector instance."""
+    """Lazy-initializes and returns the shared WHOLE-CLIP production detector.
+
+    Used by Upload & Analyze (and the whole-clip verdict in the overlay explanation). The Live Call
+    Simulation tab does NOT use this: its sessions take ``StreamingSession``'s default, the chunk-native
+    streaming detector (see :func:`create_session`).
+    """
     global _DETECTOR
     if _DETECTOR is None:
-        _DETECTOR = WeightedAverageDetector(
-            wav2vec2_classifier_path="models/classifiers/wav2vec2_hindi_combined_logreg.joblib",
-            wavlm_classifier_path="models/classifiers/wavlm_hindi_combined_logreg.joblib",
-        )
+        _DETECTOR = build_production_detector("wholeclip")
     return _DETECTOR
 
 
@@ -1094,8 +1116,8 @@ def get_prosody_extractor() -> ProsodyFeatureExtractor:
     Informational only — see compute_prosody_features() below. Its output is
     never fed into get_detector()'s risk score: Phase 2 evaluated a
     prosody-augmented classifier and found the embedding-only baseline had
-    lower EER, so the shipped detector (wav2vec2_hindi_combined_logreg +
-    wavlm_hindi_combined_logreg, both input_dim=768) uses embeddings alone.
+    lower EER, so the shipped detectors (config.PRODUCTION_WHOLECLIP_CLASSIFIERS and
+    config.PRODUCTION_STREAMING_CLASSIFIERS, all input_dim=768) use embeddings alone.
     See models/reports/decision_notes.md for that comparison.
     """
     global _PROSODY_EXTRACTOR
@@ -1105,8 +1127,20 @@ def get_prosody_extractor() -> ProsodyFeatureExtractor:
 
 
 def create_session(sample_rate: int | None = None) -> StreamingSession:
-    """Creates a new StreamingSession instance with the shared detector."""
-    return StreamingSession(detector=get_detector(), sample_rate=sample_rate)
+    """Creates a new StreamingSession on the shared chunk-native STREAMING detector.
+
+    The detector is deliberately NOT passed: ``StreamingSession``'s default is the streaming production
+    detector, the family trained on fixed-length windows, not the whole-clip one from :func:`get_detector`.
+    The flag threshold defaults to ``config.STREAM_FLAG_THRESHOLD``; the consecutive count and its unit are
+    passed explicitly because the session's own defaults (3, "pushes") are legacy, and the F4 calibration
+    (``STREAM_FLAG_THRESHOLD`` with ``STREAM_CONSECUTIVE_FLAGS_REQUIRED`` score updates) was measured with
+    per-score-update counting.
+    """
+    return StreamingSession(
+        sample_rate=sample_rate,
+        consecutive_flags_required=config.STREAM_CONSECUTIVE_FLAGS_REQUIRED,
+        consecutive_unit=config.STREAM_CONSECUTIVE_UNIT,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1189,7 @@ def process_audio_chunk(
             _risk_html(
                 contextual_score,
                 context="Live Streaming",
+                model=_streaming_model_label(),
                 base_fused_score=fusion_res["base_fused_score"],
                 audio_score=running_score,
                 keyword_score=kw_score,
@@ -1208,6 +1243,7 @@ def process_audio_chunk(
             _risk_html(
                 contextual_score,
                 context="Live Streaming",
+                model=_streaming_model_label(),
                 base_fused_score=fusion_res["base_fused_score"],
                 audio_score=running_score,
                 keyword_score=kw_score,
@@ -1271,6 +1307,7 @@ def process_audio_chunk(
     risk_html = _risk_html(
         contextual_score,
         context="Live Streaming",
+        model=_streaming_model_label(),
         base_fused_score=fusion_res["base_fused_score"],
         audio_score=running_score,
         keyword_score=kw_score,
@@ -1376,6 +1413,7 @@ def analyze_uploaded_file(
     whole_risk = _risk_html(
         whole_contextual,
         context=f"Whole-Clip · {duration:.2f}s",
+        model=_wholeclip_model_label(),
         base_fused_score=whole_fusion["base_fused_score"],
         audio_score=raw_audio_score,
         keyword_score=kw_score,
@@ -1418,6 +1456,7 @@ def analyze_uploaded_file(
     stream_risk = _risk_html(
         stream_contextual,
         context=stream_context,
+        model=_streaming_model_label(),
         base_fused_score=stream_fusion["base_fused_score"],
         audio_score=stream_audio_score,
         keyword_score=kw_score,
@@ -1705,41 +1744,157 @@ _DISCLAIMER = (
     "All processing runs locally on your machine."
 )
 
-_DIVERGENCE_NOTE = (
-    "> **Why two meters?** Whole-clip and streaming analysis evaluate audio from complementary "
-    "perspectives — whole-clip inspects the complete waveform at once, streaming makes incremental "
-    "sliding-window decisions. Both results are enriched with contextual multipliers and shown independently."
-)
+# ---------------------------------------------------------------------------
+# Model provenance — every string below is built from config at call time and never hardcoded, so the
+# UI cannot drift from what is actually loaded (app.get_detector() / StreamingSession's default).
+# ---------------------------------------------------------------------------
+
+
+def _head_id(backbone: str, rel_path: str) -> str:
+    """Short head name from a configured classifier path.
+
+    ``models/classifiers/wavlm_chunked_v2_logreg.joblib`` -> ``chunked_v2`` (backbone prefix and the
+    ``_logreg`` suffix are stripped), so swapping a configured file changes the label automatically.
+    """
+    stem = Path(rel_path).stem
+    if stem.startswith(f"{backbone}_"):
+        stem = stem[len(backbone) + 1:]
+    if stem.endswith("_logreg"):
+        stem = stem[: -len("_logreg")]
+    return stem
+
+
+def _family_heads(mapping: dict[str, str]) -> str:
+    """``wav2vec2 <head> + WavLM <head>`` for one PRODUCTION_*_CLASSIFIERS dict."""
+    return f"wav2vec2 {_head_id('wav2vec2', mapping['wav2vec2'])} + WavLM {_head_id('wavlm', mapping['wavlm'])}"
+
+
+def _window_text() -> str:
+    return "" if config.STREAM_CHUNK_SECONDS is None else f"{config.STREAM_CHUNK_SECONDS:g} s windows"
+
+
+def _wholeclip_model_label() -> str:
+    """Label for a verdict produced by the WHOLE-CLIP production detector."""
+    return f"whole-clip · {_family_heads(config.PRODUCTION_WHOLECLIP_CLASSIFIERS)}"
+
+
+def _streaming_model_label() -> str:
+    """Label for a verdict produced by the chunk-native STREAMING production detector."""
+    parts = ["streaming", _family_heads(config.PRODUCTION_STREAMING_CLASSIFIERS)]
+    if config.STREAM_CHUNK_SECONDS is not None:
+        parts.append(_window_text())
+    return " · ".join(parts)
+
+
+def _flag_rule_text() -> str:
+    singular, plural = {
+        "updates": ("score update", "score updates"),
+        "pushes": ("push", "pushes"),
+    }.get(config.STREAM_CONSECUTIVE_UNIT, (config.STREAM_CONSECUTIVE_UNIT, config.STREAM_CONSECUTIVE_UNIT))
+    n = config.STREAM_CONSECUTIVE_FLAGS_REQUIRED
+    return f"running score ≥ {config.STREAM_FLAG_THRESHOLD:g} for {n} consecutive {singular if n == 1 else plural}"
+
+
+def _risk_bands_text() -> str:
+    return f"{config.RISK_THRESHOLDS['low_max']:g}/{config.RISK_THRESHOLDS['medium_max']:g}"
+
+
+def _provenance_html() -> str:
+    """The always-visible model-provenance line (shown under the title), generated from config."""
+    w = float(config.PRODUCTION_ENSEMBLE_WEIGHT_A)
+    items = [
+        "Detector: weighted-average ensemble (wav2vec2 + WavLM)",
+        f"whole-clip: {_family_heads(config.PRODUCTION_WHOLECLIP_CLASSIFIERS)}",
+        f"streaming: {_family_heads(config.PRODUCTION_STREAMING_CLASSIFIERS)}"
+        + (f" ({_window_text()})" if config.STREAM_CHUNK_SECONDS is not None else ""),
+        f"ensemble weight {w:g}/{1 - w:g} (wav2vec2/WavLM)",
+        f"risk bands {_risk_bands_text()}",
+        f"stream flag: {_flag_rule_text()}",
+    ]
+    text = " &nbsp;|&nbsp; ".join(html.escape(i) for i in items)
+    return (
+        '<div class="vg-provenance" style="margin:6px 2px 10px 2px; padding:7px 12px; '
+        "border:1px solid var(--vg-border); border-radius:8px; background:var(--vg-surface); "
+        'font-family:var(--vg-mono); font-size:0.78em; line-height:1.5; color:var(--vg-text-dim);">'
+        '<span class="material-symbols-outlined" style="font-size:14px; vertical-align:-2px; margin-right:6px; '
+        f'color:var(--vg-cyan);">model_training</span>{text}</div>'
+    )
+
+
+def _divergence_note() -> str:
+    """Why the two meters on Upload & Analyze can disagree: they are two different models. From config."""
+    return (
+        "> **Why two meters?** They come from two different model families, so their numbers "
+        "are not expected to match. **Whole-clip** scores the complete waveform at once with "
+        f"{_family_heads(config.PRODUCTION_WHOLECLIP_CLASSIFIERS)} (trained on whole-clip embeddings). "
+        f"**Streaming** replays the file as fixed-length windows ({_window_text() or 'windows'}) through "
+        f"{_family_heads(config.PRODUCTION_STREAMING_CLASSIFIERS)} (trained on windows of that size) and flags when the "
+        f"{_flag_rule_text()}. Each verdict card is labelled with the model that produced it. Both results are "
+        "enriched with contextual multipliers and shown independently."
+    )
 
 # ---------------------------------------------------------------------------
 # Cross-Dataset Results tab content
 # ---------------------------------------------------------------------------
-# Read-only: loads the two evaluation reports straight from disk (rather
+# Read-only: loads the evaluation reports listed in _CROSS_DATASET_SOURCES straight from disk (rather
 # than re-typing/duplicating their tables here) so this tab always reflects
-# whatever scripts/evaluate_*.py last wrote, with no separate copy to fall
-# out of sync.
+# whatever the evaluation scripts last wrote, with no separate copy to fall
+# out of sync. Reports are grouped BEFORE FIX / AFTER FIX; the originals are kept.
 
-_GENERALIZATION_REPORT_PATH = Path("models") / "reports" / "generalization_before_after.md"
-_HINDI_COMPARISON_REPORT_PATH = Path("models") / "reports" / "hindi_training_comparison.md"
+_REPORTS_DIR = Path("models") / "reports"
 
-# IMPORTANT: VoxGuard's shipped production detector (get_detector(), used by
-# every tab above) is the WEIGHTED-AVERAGE ENSEMBLE of the two Hindi-combined
-# backbones — wav2vec2_hindi_combined_logreg + wavlm_hindi_combined_logreg
-# (row 6 / the "Weighted-Average Ensemble (4+5)" row in the Hindi comparison
-# table below). It is NOT either individual backbone alone, and the reports'
-# own per-backbone "Variant A" labels refer to a *training strategy*
-# (combined ASVspoof2019 + Hindi training data), not a single classifier
-# that was shipped by itself — the production system always ensembles both.
-_PRODUCTION_DETECTOR_NOTE = (
-    "**What's actually shipped:** VoxGuard's production detector "
-    "(`WeightedAverageDetector`, loaded by every tab above) is the "
-    "**weighted-average ensemble of the two Hindi-combined backbones** — "
-    "`wav2vec2_hindi_combined_logreg` + `wavlm_hindi_combined_logreg` "
-    "(row 6 in the table below). Individual backbone rows and the "
-    "\"Variant A / Variant B\" labels describe *training strategies* that "
-    "were compared during development, not alternative single-model "
-    "deployments — nothing here ships as a lone classifier."
-)
+# Every report the tab displays: (stage, title, material icon, path). Rows render grouped by stage, in this order.
+# To surface another report, append ONE row here (the stage group is created automatically); nothing else in
+# the tab needs to change. Only reports that exist belong here.
+_CROSS_DATASET_SOURCES: list[tuple[str, str, str, Path]] = [
+    ("BEFORE FIX", "Cross-Dataset Generalization (Phase 3)", "public",
+     _REPORTS_DIR / "generalization_before_after.md"),
+    ("BEFORE FIX", "Hindi/Hinglish Training Comparison (Phase 4)", "translate",
+     _REPORTS_DIR / "hindi_training_comparison.md"),
+    ("AFTER FIX", "Duration-Matched Hindi Heads: Original vs Matched (F1.5)", "rule",
+     _REPORTS_DIR / "fix_matched_comparison.md"),
+    ("AFTER FIX", "Chunk-Native Heads: Held-Out Evaluation (F2.4)", "stream",
+     _REPORTS_DIR / "fix_chunked_eval.md"),
+]
+
+_STAGE_COLORS = {"BEFORE FIX": "var(--vg-amber)", "AFTER FIX": "var(--vg-green)"}
+
+
+def _production_detector_note() -> str:
+    """What is actually shipped, generated from config (never hardcoded, so it cannot go stale)."""
+    w = float(config.PRODUCTION_ENSEMBLE_WEIGHT_A)
+    return (
+        "**What's actually shipped (read from config):** VoxGuard's production detector is a "
+        f"**weighted-average ensemble of two backbones, wav2vec2 + WavLM** (weight {w:g}/{1 - w:g}), in two families "
+        "because the two inference paths score different inputs. "
+        f"**Whole-clip** (the Upload & Analyze verdict): {_family_heads(config.PRODUCTION_WHOLECLIP_CLASSIFIERS)}. "
+        f"**Streaming** (Live Call Simulation and the streaming replay on Upload & Analyze): "
+        f"{_family_heads(config.PRODUCTION_STREAMING_CLASSIFIERS)}, chunk-native heads trained on "
+        f"{_window_text() or 'fixed-length windows'}, flagging when the {_flag_rule_text()}. "
+        f"Risk bands {_risk_bands_text()}. Nothing here ships as a lone classifier. "
+        "Rows inside the BEFORE FIX reports describe the pre-fix development stage (including the "
+        "training-strategy variants compared then), not the shipped models."
+    )
+
+
+def _cross_dataset_stage_note(stage: str) -> str:
+    """One-paragraph framing for a stage group in the Cross-Dataset Results tab."""
+    if stage == "BEFORE FIX":
+        return (
+            "Reports written **before** the fix guide, describing the pre-fix detector. Kept unchanged "
+            "as the before side of the comparison."
+        )
+    if stage == "AFTER FIX":
+        return (
+            "Reports written **by the fix guide**. "
+            "**The F1.5 and F2.4 reports predate the F3 WavLM retrain:** their WavLM rows use the first-generation heads "
+            "(`wavlm_hindi_matched` and `wavlm_chunked`), whereas the shipped detector uses the retrained "
+            f"WavLM heads (`{_head_id('wavlm', config.PRODUCTION_WHOLECLIP_CLASSIFIERS['wavlm'])}` whole-clip, "
+            f"`{_head_id('wavlm', config.PRODUCTION_STREAMING_CLASSIFIERS['wavlm'])}` streaming). "
+            "The retrain's own before/after is in `models/reports/fix_wavlm_v2_retrain.md`. "
+            "Compare rows only within one report: the test sets differ between reports (see each report's notes)."
+        )
+    return ""
 
 
 def _load_report_markdown(path: Path) -> str:
@@ -1802,6 +1957,9 @@ def _hero_html() -> str:
 
 def build_app() -> gr.Blocks:
     """Builds the Gradio UI shell for the VoxGuard demo app."""
+    # Once, at startup (this runs at import via `app = build_app()`): a missing production classifier file
+    # must fail loudly at launch with its path named, not on the first request.
+    verify_production_classifiers()
     with gr.Blocks(
         title="VoxGuard — Voice Cloning Detection & Prevention",
         css=_CUSTOM_CSS,
@@ -1809,6 +1967,7 @@ def build_app() -> gr.Blocks:
     ) as demo:
         gr.HTML(_splash_html())
         gr.HTML(_hero_html())
+        gr.HTML(_provenance_html)      # callable: re-read from config on every page load
 
         # App-level shared state for voiceprint verification across tabs
         last_voiceprint_result: gr.State = gr.State(value=None)
@@ -1923,7 +2082,7 @@ def build_app() -> gr.Blocks:
                     "an explainability overlay — all fused into the same contextual risk score "
                     "used on the Live Call Simulation tab."
                 )
-                gr.Markdown(_DIVERGENCE_NOTE)
+                gr.Markdown(_divergence_note())
 
                 # Stores the filepath of the most-recently analyzed clip so the
                 # explainability overlay always corresponds to the current verdict.
@@ -2137,10 +2296,11 @@ def build_app() -> gr.Blocks:
                 )
 
             # ================================================================
-            # Cross-Dataset Results tab — read-only. Displays Phase 3's
-            # generalization report and Phase 4's Hindi/Hinglish training
-            # comparison report so judges can see both without leaving the
-            # app. No inputs, no callbacks — content is loaded once at
+            # Cross-Dataset Results tab — read-only. Displays the pre-fix reports
+            # (Phase 3 generalization, Phase 4 Hindi/Hinglish comparison) as BEFORE FIX
+            # and the fix guide's reports as AFTER FIX, from the registry
+            # _CROSS_DATASET_SOURCES, so judges can see the contrast without
+            # leaving the app. No inputs, no callbacks — content is loaded once at
             # app-build time straight from the report files on disk.
             # ================================================================
             with gr.Tab("Cross-Dataset Results"):
@@ -2148,23 +2308,29 @@ def build_app() -> gr.Blocks:
                     "Read-only evaluation evidence generated by this project's "
                     "training/evaluation scripts — not live-recomputed here."
                 )
-                gr.Markdown(_PRODUCTION_DETECTOR_NOTE, elem_classes=["vg-panel"])
+                gr.Markdown(_production_detector_note(), elem_classes=["vg-panel"])
 
-                with gr.Column(elem_classes=["vg-panel", "vg-reveal", "vg-reveal-1"]):
+                # Grouped by stage, in registry order; adding a report (or a third AFTER FIX source) is a one-row
+                # change to _CROSS_DATASET_SOURCES.
+                for stage in dict.fromkeys(s for s, _, _, _ in _CROSS_DATASET_SOURCES):
+                    color = _STAGE_COLORS.get(stage, "var(--vg-cyan)")
                     gr.HTML(
-                        '<div class="vg-section-title">'
-                        '<span class="material-symbols-outlined vg-sec-icon">public</span>'
-                        "Cross-Dataset Generalization (Phase 3)</div>"
+                        f'<div style="margin:14px 0 4px 0; display:flex; align-items:center; gap:10px;">'
+                        f'<span style="font-family:var(--vg-mono); font-weight:800; letter-spacing:0.08em; '
+                        f'padding:3px 10px; border-radius:6px; border:1px solid {color}; color:{color};">'
+                        f"{html.escape(stage)}</span></div>"
                     )
-                    gr.Markdown(_load_report_markdown(_GENERALIZATION_REPORT_PATH))
-
-                with gr.Column(elem_classes=["vg-panel", "vg-reveal", "vg-reveal-2"]):
-                    gr.HTML(
-                        '<div class="vg-section-title">'
-                        '<span class="material-symbols-outlined vg-sec-icon">translate</span>'
-                        "Hindi/Hinglish Training Comparison (Phase 4)</div>"
-                    )
-                    gr.Markdown(_load_report_markdown(_HINDI_COMPARISON_REPORT_PATH))
+                    gr.Markdown(_cross_dataset_stage_note(stage))
+                    for _stage, title, icon, path in _CROSS_DATASET_SOURCES:
+                        if _stage != stage:
+                            continue
+                        with gr.Column(elem_classes=["vg-panel", "vg-reveal", "vg-reveal-1"]):
+                            gr.HTML(
+                                '<div class="vg-section-title">'
+                                f'<span class="material-symbols-outlined vg-sec-icon">{icon}</span>'
+                                f"{html.escape(title)}</div>"
+                            )
+                            gr.Markdown(_load_report_markdown(path))
 
     return demo
 

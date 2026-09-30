@@ -227,3 +227,34 @@ def test_consecutive_unit_updates_ignores_silent_windows() -> None:
         result = session.push_audio(loud, 16000)
     assert result["flagged"] is True
     assert session._seconds_to_flag == 4.0
+
+
+def test_default_detector_is_the_shared_streaming_production_detector(monkeypatch) -> None:
+    """StreamingSession() with no detector takes the STREAMING family (not whole-clip), via the shared accessor."""
+    import voxguard.streaming.session as session_module
+
+    sentinel = _SequencedDetector([0.5])
+    modes = []
+
+    def fake_get(mode):
+        modes.append(mode)
+        return sentinel
+
+    monkeypatch.setattr(session_module, "get_production_detector", fake_get)
+    session = StreamingSession()
+    assert session.detector is sentinel
+    assert modes == ["streaming"]
+    # legacy defaults are intentionally unchanged; production callers override them from config
+    assert session.consecutive_unit == "pushes"
+    assert session.consecutive_flags_required == 3
+
+
+def test_explicit_detector_bypasses_the_default(monkeypatch) -> None:
+    import voxguard.streaming.session as session_module
+
+    def boom(mode):
+        raise AssertionError("default detector must not be built when one is passed")
+
+    monkeypatch.setattr(session_module, "get_production_detector", boom)
+    detector = _SequencedDetector([0.5])
+    assert StreamingSession(detector=detector).detector is detector
