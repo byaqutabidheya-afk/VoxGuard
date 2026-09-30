@@ -30,9 +30,20 @@ gradient-based saliency method.  The choice is intentional and defensible:
   that segment*.  No proxy model, no approximation assumptions.
 
 * The resolution (window_seconds × stride_seconds) is coarse by design.
-  It is calibrated to the classifier's minimum useful input length (~0.5 s)
-  rather than sample-level precision.  Claiming sub-frame precision would be
-  misleading given the backbone's own temporal pooling.
+  Claiming sub-frame precision would be misleading given the backbone's own
+  temporal pooling.
+
+Which detector and which window (Phase F4.3)
+--------------------------------------------
+By default this module scores windows with the CHUNK-NATIVE heads in
+``config.PRODUCTION_STREAMING_CLASSIFIERS`` and uses a window of exactly
+``config.STREAM_CHUNK_SECONDS``, the window size those heads were trained on.
+Attribution does what the chunked family exists to do (score short windows), and
+a window of any other length puts the chunked model outside its training
+distribution, so ``window_seconds`` is deliberately NOT hardcoded here. The STRIDE
+is free: it only sets the heatmap's time resolution, not what the model sees in
+each scoring call.  Earlier defaults (0.5 s, then 1.5 s) were tuned by eye against
+the old whole-clip model.
 
 Returned scores of ``None`` for a window indicate that the silence-detection
 gate fired (near-zero RMS) or that the detector raised on that window.
@@ -41,19 +52,18 @@ signal" — they are distinct states.
 
 Usage example::
 
-    from voxguard.classifier.ensemble import WeightedAverageDetector
     from voxguard.explain.attribution import windowed_attribution
     from voxguard.utils.audio_io import load_audio
 
     waveform, sr = load_audio("call.wav")
-    detector = WeightedAverageDetector(...)
-    scores, times = windowed_attribution(waveform, sr, detector)
+    scores, times = windowed_attribution(waveform, sr)   # chunked heads, config window
     # scores[i] is P(synthetic) for the window starting at times[i] seconds
 """
 
 from __future__ import annotations
 
-from typing import Any
+from functools import lru_cache
+from typing import Any, Optional
 
 import numpy as np
 
@@ -66,13 +76,34 @@ logger = get_logger(__name__)
 # Matches the threshold used in StreamingScorer and VoxGuardDetector._rms_energy.
 _SILENCE_THRESHOLD: float = 0.01
 
+# Heatmap time resolution. Free to differ from the chunked heads' training stride (it only
+# controls how often a window is scored, not what the model sees per call).
+DEFAULT_STRIDE_SECONDS: float = 0.75
+
+
+@lru_cache(maxsize=1)
+def get_default_detector() -> Any:
+    """Shared ``WeightedAverageDetector`` on ``config.PRODUCTION_STREAMING_CLASSIFIERS``.
+
+    Built lazily (it loads both SSL backbones) and cached for the process. Weight is
+    ``config.PRODUCTION_ENSEMBLE_WEIGHT_A``.
+    """
+    from voxguard.classifier.ensemble import WeightedAverageDetector
+
+    paths = {b: config.BASE_DIR / p for b, p in config.PRODUCTION_STREAMING_CLASSIFIERS.items()}
+    return WeightedAverageDetector(
+        wav2vec2_classifier_path=paths["wav2vec2"],
+        wavlm_classifier_path=paths["wavlm"],
+        weight_a=config.PRODUCTION_ENSEMBLE_WEIGHT_A,
+    )
+
 
 def windowed_attribution(
     waveform: np.ndarray,
     sr: int,
-    detector: Any,
-    window_seconds: float = 0.5,
-    stride_seconds: float = 0.25,
+    detector: Any = None,
+    window_seconds: Optional[float] = None,
+    stride_seconds: float = DEFAULT_STRIDE_SECONDS,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Score overlapping windows of *waveform* and return ``(scores, timestamps)``.
 
@@ -100,13 +131,18 @@ def windowed_attribution(
         returning a dict with a ``"probability_synthetic"`` key.  This is
         the same interface required by ``StreamingScorer`` — both
         ``VoxGuardDetector`` and ``WeightedAverageDetector`` satisfy it.
+        ``None`` (the default) uses :func:`get_default_detector`: the chunk-native
+        heads in ``config.PRODUCTION_STREAMING_CLASSIFIERS``.
     window_seconds:
-        Duration of each analysis window in seconds.  Defaults to 0.5 s,
-        which is the practical minimum for the SSL backbones (shorter
-        windows produce meaningless embeddings due to temporal pooling).
+        Duration of each analysis window in seconds.  ``None`` (the default)
+        uses ``config.STREAM_CHUNK_SECONDS`` exactly: the window size the chunked
+        heads were trained on.  Passing a different value with the default
+        detector logs a warning, because it puts the chunked heads outside their
+        training distribution.
     stride_seconds:
         Step size between consecutive window starts in seconds.  Defaults
-        to 0.25 s (50 % overlap).  Must be > 0 and ≤ *window_seconds*.
+        to 0.75 s.  Free to differ from the training stride (it only sets the
+        heatmap's time resolution).  Must be > 0 and ≤ the window length.
 
     Returns
     -------
@@ -171,7 +207,8 @@ def windowed_attribution(
     ...         return {"probability_synthetic": 0.42, "label": "synthetic"}
     >>> rng = np.random.default_rng(0)
     >>> wav = (rng.standard_normal(16000) * 0.1).astype(np.float32)
-    >>> scores, timestamps = windowed_attribution(wav, 16000, _ConstDetector())
+    >>> scores, timestamps = windowed_attribution(
+    ...     wav, 16000, _ConstDetector(), window_seconds=0.5, stride_seconds=0.25)
     >>> scores.shape == timestamps.shape     # both (n_windows,)
     True
     >>> scores.dtype == timestamps.dtype == np.float64
@@ -181,11 +218,36 @@ def windowed_attribution(
     >>> float(scores[0])                     # P(synthetic) for first window
     0.42
     >>> # Convert to center times if needed:
-    >>> center_times = timestamps + 0.5 / 2  # window_seconds=0.5 default
+    >>> center_times = timestamps + 0.5 / 2  # window_seconds=0.5 as passed above
     """
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
+    using_default_detector = detector is None
+    if using_default_detector:
+        detector = get_default_detector()
+
+    if window_seconds is None:
+        if config.STREAM_CHUNK_SECONDS is None:
+            raise ValueError(
+                "window_seconds was not given and config.STREAM_CHUNK_SECONDS is None; "
+                "set one of them."
+            )
+        window_seconds = float(config.STREAM_CHUNK_SECONDS)
+    elif (
+        using_default_detector
+        and config.STREAM_CHUNK_SECONDS is not None
+        and abs(float(window_seconds) - float(config.STREAM_CHUNK_SECONDS)) > 1e-9
+    ):
+        logger.warning(
+            "windowed_attribution: window_seconds=%.3f differs from config.STREAM_CHUNK_SECONDS=%.3f "
+            "while using the chunk-native default detector; its heads were trained on %.3f s "
+            "windows, so scores from this window are outside their training distribution.",
+            float(window_seconds),
+            float(config.STREAM_CHUNK_SECONDS),
+            float(config.STREAM_CHUNK_SECONDS),
+        )
+
     if not hasattr(detector, "predict_waveform"):
         raise TypeError(
             "detector must expose predict_waveform(waveform, sr); "

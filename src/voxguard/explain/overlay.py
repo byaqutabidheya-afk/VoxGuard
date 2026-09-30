@@ -45,11 +45,11 @@ This means NaN propagation into a crashed/blank render is impossible, and
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 
-from voxguard.explain.attribution import windowed_attribution
+from voxguard.explain.attribution import DEFAULT_STRIDE_SECONDS, windowed_attribution
 from voxguard.explain.describe import describe_attribution
 from voxguard.explain.spectrogram import (
 
@@ -152,13 +152,13 @@ def _interpolate_scores_to_frames(
 def render_explainability_overlay(
     waveform: np.ndarray,
     sr: int,
-    detector: Any,
+    detector: Any = None,
     output_path: Union[str, Path] = "overlay.png",
     n_mels: int = DEFAULT_N_MELS,
     hop_length: int = DEFAULT_HOP_LENGTH,
     n_fft: int = DEFAULT_N_FFT,
-    window_seconds: float = 1.5,
-    stride_seconds: float = 0.75,
+    window_seconds: Optional[float] = None,
+    stride_seconds: float = DEFAULT_STRIDE_SECONDS,
     heatmap_alpha: float = 0.45,
     figsize: tuple[float, float] = (12.0, 4.5),
     dpi: int = 150,
@@ -171,7 +171,8 @@ def render_explainability_overlay(
     1. Compute the log-mel spectrogram of *waveform* via
        :func:`~voxguard.explain.spectrogram.generate_mel_spectrogram`.
     2. Run :func:`~voxguard.explain.attribution.windowed_attribution` with
-       the same *detector* used throughout the project.
+       *detector* (default: the chunk-native heads in
+       ``config.PRODUCTION_STREAMING_CLASSIFIERS``).
     3. Interpolate the per-window scores (which may contain ``np.nan`` for
        silent windows) onto the dense spectrogram time axis, and separately
        compute a per-frame alpha mask marking which frames actually fall
@@ -202,7 +203,9 @@ def render_explainability_overlay(
     detector:
         Any object exposing ``predict_waveform(waveform, sr)`` that returns
         a dict with ``"probability_synthetic"``.  Both ``VoxGuardDetector``
-        and ``WeightedAverageDetector`` qualify.
+        and ``WeightedAverageDetector`` qualify.  ``None`` (the default) uses
+        the chunk-native heads in ``config.PRODUCTION_STREAMING_CLASSIFIERS``
+        (see :func:`~voxguard.explain.attribution.get_default_detector`).
     output_path:
         Destination path for the PNG.  Parent directories are created
         automatically.  Accepts ``str`` or ``pathlib.Path``.  Returns the
@@ -215,19 +218,14 @@ def render_explainability_overlay(
     n_fft:
         FFT window size in samples (default 2048).
     window_seconds:
-        Attribution window length in seconds.  Defaults to 1.5 s —
-        empirically verified on the ``soumya_neutral_01`` real/synthetic
-        pair to produce a correctly-directioned, visually clear overlay.
-        The originally speculative 0.5 s default did not reliably
-        discriminate real from synthetic on that pair or other tested clips
-        (short windows give the classifier too little context per step,
-        adding attribution noise without adding real signal).
-        Still fully overridable per call.
+        Attribution window length in seconds.  ``None`` (the default) uses
+        ``config.STREAM_CHUNK_SECONDS`` exactly, the window size the chunk-native
+        heads were trained on; any other value puts them outside their training
+        distribution (``windowed_attribution`` logs a warning).
     stride_seconds:
-        Attribution window stride in seconds.  Defaults to 0.75 s (50 %
-        overlap with the 1.5 s window) — empirically validated alongside
-        *window_seconds* on the same test pairs.  Still fully overridable
-        per call.
+        Attribution window stride in seconds.  Defaults to 0.75 s.  Free to
+        differ from the training stride: it only sets the heatmap's time
+        resolution, not what the model sees per scoring call.
     heatmap_alpha:
         Maximum alpha of the synthetic-likelihood heatmap overlay.
         Each pixel's actual alpha = ``heatmap_alpha × score``, so a score

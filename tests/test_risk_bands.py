@@ -38,6 +38,14 @@ from voxguard.risk.bands import (
 _DEFAULT = None  # sentinel: use config defaults
 _CUSTOM = {"low_max": 0.4, "medium_max": 0.6}
 
+# Interior scores derived from the LIVE config thresholds, never hardcoded, so recalibrating
+# RISK_THRESHOLDS cannot silently turn an "interior" test into a boundary test (or a wrong one).
+_LOW_MAX = float(config.RISK_THRESHOLDS["low_max"])
+_MEDIUM_MAX = float(config.RISK_THRESHOLDS["medium_max"])
+_LOW_INTERIOR = _LOW_MAX / 2.0                        # well inside "low"
+_MEDIUM_INTERIOR = (_LOW_MAX + _MEDIUM_MAX) / 2.0     # midpoint of "medium"
+_HIGH_INTERIOR = (_MEDIUM_MAX + 1.0) / 2.0            # midpoint of "high"
+
 
 # ---------------------------------------------------------------------------
 # Interior values — well away from boundaries
@@ -49,11 +57,11 @@ def test_low_interior() -> None:
 
 
 def test_low_interior_midpoint() -> None:
-    assert score_to_band(0.15) == BAND_LOW
+    assert score_to_band(_LOW_INTERIOR) == BAND_LOW
 
 
 def test_medium_interior() -> None:
-    assert score_to_band(0.5) == BAND_MEDIUM
+    assert score_to_band(_MEDIUM_INTERIOR) == BAND_MEDIUM
 
 
 def test_high_interior() -> None:
@@ -61,7 +69,7 @@ def test_high_interior() -> None:
 
 
 def test_high_interior_midpoint() -> None:
-    assert score_to_band(0.85) == BAND_HIGH
+    assert score_to_band(_HIGH_INTERIOR) == BAND_HIGH
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +118,9 @@ def test_boundary_medium_max_config_value_maps_to_high() -> None:
 
 
 def test_just_below_low_max() -> None:
-    """0.3 - ε should still be 'low'."""
-    assert score_to_band(0.2999) == BAND_LOW
+    """low_max - ε should still be 'low'."""
+    low_max = float(config.RISK_THRESHOLDS["low_max"])
+    assert score_to_band(low_max - 1e-4) == BAND_LOW
 
 
 def test_just_above_low_max() -> None:

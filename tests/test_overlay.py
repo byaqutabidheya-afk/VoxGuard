@@ -303,3 +303,23 @@ def test_render_no_figure_leak():
             )
         after = len(plt.get_fignums())
     assert after <= before
+
+
+def test_overlay_detector_none_uses_config_chunked_detector(monkeypatch, tmp_path) -> None:
+    """render_explainability_overlay with no detector takes the chunk-native default, and scores at the config window."""
+    import voxguard.explain.attribution as attribution
+    from voxguard import config
+
+    seen_windows = []
+
+    class _Recording:
+        def predict_waveform(self, w, sr):
+            seen_windows.append(len(w) / sr)
+            return {"probability_synthetic": 0.5, "label": "synthetic"}
+
+    monkeypatch.setattr(attribution, "get_default_detector", lambda: _Recording())
+    rng = np.random.default_rng(0)
+    wav = (rng.standard_normal(SR * 4) * 0.1).astype(np.float32)
+    out = render_explainability_overlay(wav, SR, output_path=tmp_path / "o.png")
+    assert Path(out).exists()
+    assert seen_windows and all(abs(w - config.STREAM_CHUNK_SECONDS) < 1e-3 for w in seen_windows)

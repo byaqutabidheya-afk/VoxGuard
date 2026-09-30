@@ -1,28 +1,31 @@
 #!/usr/bin/env python
-"""calibrate_thresholds.py — calibrate RISK_THRESHOLDS against the dev split.
+"""calibrate_thresholds.py - calibrate RISK_THRESHOLDS against the dev split.
 
 Usage
 -----
-    python scripts/calibrate_thresholds.py [--split dev|eval] [--weight-a 0.5]
+    python scripts/calibrate_thresholds.py [--split dev] [--weight-a W]
+
+    --weight-a defaults to config.PRODUCTION_ENSEMBLE_WEIGHT_A. --split eval is
+    allowed for read-only inspection only; the script refuses to write config.py from it.
 
 What it does
 ------------
 1. Loads cached dev (or eval) embeddings for the wav2vec2 and WavLM backbones
    from models/embeddings/.
-2. Scores every clip with the WeightedAverageDetector (the same pair of
-   classifiers the app uses: wav2vec2_hindi_combined_logreg +
-   wavlm_hindi_combined_logreg), exactly as the live inference path does.
+2. Scores every clip with the production whole-clip WeightedAverageDetector:
+   the classifier pair in config.PRODUCTION_WHOLECLIP_CLASSIFIERS combined with
+   config.PRODUCTION_ENSEMBLE_WEIGHT_A, exactly as the live whole-clip path will.
 3. Sweeps a grid of (low_max, medium_max) candidate threshold pairs.
 4. For each pair, reports:
-     FPR_low   — fraction of real clips left in the "low" band   (missed alert)
-     FNR_high  — fraction of synthetic clips flagged "high"       (true positives, used
+     FPR_low   - fraction of real clips left in the "low" band   (missed alert)
+     FNR_high  - fraction of synthetic clips flagged "high"       (true positives, used
                  to check we're not being too conservative)
-     FPR_flag  — fraction of real clips reaching "medium" or "high" (false-alarm rate
+     FPR_flag  - fraction of real clips reaching "medium" or "high" (false-alarm rate
                  a user sees in practice)
-     FNR_low   — fraction of synthetic clips left at "low"        (missed detection)
+     FNR_low   - fraction of synthetic clips left at "low"        (missed detection)
 5. Prints a ranked table and marks the current config.RISK_THRESHOLDS values.
 6. Prompts the user to accept or change the thresholds, then updates
-   config.py — only after explicit user confirmation.
+   config.py - only after explicit user confirmation.
 
 Why the dev split?
 ------------------
@@ -32,10 +35,11 @@ for the Phase 3 headline numbers; calibrating on it would be data leakage.
 
 Which detector?
 ---------------
-WeightedAverageDetector (wav2vec2_hindi_combined_logreg +
-wavlm_hindi_combined_logreg, weight_a=0.5) — the same one the app runs.
-Using any other classifier here would produce thresholds that don't match
-the app's actual score distribution.
+The production whole-clip WeightedAverageDetector: the heads listed in
+config.PRODUCTION_WHOLECLIP_CLASSIFIERS (F1 matched wav2vec2 + F3 v2 WavLM) at
+config.PRODUCTION_ENSEMBLE_WEIGHT_A. Using any other classifier here would
+produce thresholds that don't match the production score distribution.
+The streaming (chunk-native) family is NOT calibrated by this script.
 """
 
 from __future__ import annotations
@@ -74,8 +78,9 @@ CLASSIFIERS_DIR = config.MODELS_DIR / "classifiers"
 WAV2VEC2_CACHE_TEMPLATE = str(EMBEDDINGS_DIR / "wav2vec2_{split}.npy")
 WAVLM_CACHE_TEMPLATE = str(EMBEDDINGS_DIR / "wavlm_{split}.npy")
 
-CLASSIFIER_A_PATH = str(CLASSIFIERS_DIR / "wav2vec2_hindi_combined_logreg")
-CLASSIFIER_B_PATH = str(CLASSIFIERS_DIR / "wavlm_hindi_combined_logreg")
+# Production whole-clip heads and ensemble weight come from config, not from paths hardcoded here.
+CLASSIFIER_A_PATH = str(config.BASE_DIR / config.PRODUCTION_WHOLECLIP_CLASSIFIERS["wav2vec2"])
+CLASSIFIER_B_PATH = str(config.BASE_DIR / config.PRODUCTION_WHOLECLIP_CLASSIFIERS["wavlm"])
 
 CONFIG_PATH = _REPO_ROOT / "src" / "voxguard" / "config.py"
 
@@ -89,7 +94,7 @@ CONFIG_PATH = _REPO_ROOT / "src" / "voxguard" / "config.py"
 CANDIDATE_PAIRS: list[tuple[float, float]] = [
     (0.20, 0.60),
     (0.25, 0.65),
-    (0.30, 0.70),   # current default
+    (0.30, 0.70),
     (0.35, 0.70),
     (0.30, 0.75),
     (0.40, 0.75),
@@ -115,7 +120,7 @@ def load_ensemble_scores(split: str, weight_a: float) -> tuple[np.ndarray, np.nd
 
     _validate_manifest_alignment(cache_a, manifest_a, cache_b, manifest_b)
 
-    print(f"  Loading classifiers …")
+    print(f"  Loading classifiers ...")
     model_a, scaler_a = load_classifier(CLASSIFIER_A_PATH)
     model_b, scaler_b = load_classifier(CLASSIFIER_B_PATH)
 
@@ -141,10 +146,10 @@ def compute_rates(
 ) -> dict[str, float]:
     """Compute false-positive and false-negative rates for one threshold pair.
 
-    Band assignment (from voxguard.risk.bands convention — boundary → higher band):
-        score <  low_max                  → "low"
-        low_max <= score <= medium_max    → "medium"
-        score >  medium_max              → "high"
+    Band assignment (from voxguard.risk.bands convention - boundary -> higher band):
+        score <  low_max                  -> "low"
+        low_max <= score <= medium_max    -> "medium"
+        score >  medium_max              -> "high"
 
     Metrics
     -------
@@ -202,7 +207,7 @@ def build_table(
                 "FPR_flag(FA%)":   round(r["fpr_medium_high"] * 100, 2),
                 "FPR_high(FA%)":   round(r["fpr_high"] * 100, 2),
                 "TPR_high(det%)":  round(r["tpr_high"] * 100, 2),
-                "current":         "← current" if is_current else "",
+                "current":         "<- current" if is_current else "",
             }
         )
     return pd.DataFrame(rows)
@@ -238,18 +243,18 @@ def print_table(df: pd.DataFrame) -> None:
 def explain_columns() -> None:
     print(textwrap.dedent("""\
         Column guide
-        ────────────
-        FNR_low (miss%)     — % of synthetic clips that slip through as "low risk"
+        ------------
+        FNR_low (miss%)     - % of synthetic clips that slip through as "low risk"
                               (missed detections). Lower is better for security.
-        FPR_flag (false-alm%) — % of real clips that trigger "medium" or "high".
+        FPR_flag (false-alm%) - % of real clips that trigger "medium" or "high".
                               (false alarms seen by users). Lower is better for UX.
-        FPR_high (FA%)      — % of real clips that trigger "high" specifically.
+        FPR_high (FA%)      - % of real clips that trigger "high" specifically.
                               Aim for near-zero; high false alarms on real calls destroy trust.
-        TPR_high (det%)     — % of synthetic clips confidently caught as "high risk".
+        TPR_high (det%)     - % of synthetic clips confidently caught as "high risk".
                               Higher is better; pairs with FNR_low to show the full picture.
 
         Recommended selection heuristic
-        ────────────────────────────────
+        --------------------------------
         Pick the row where FPR_high is < 5 % AND FNR_low is minimised.
         If FNR_low < 5 % is achievable, prefer the pair with lower FPR_flag.
     """))
@@ -259,20 +264,22 @@ def patch_config(new_low_max: float, new_medium_max: float) -> None:
     """Rewrite RISK_THRESHOLDS in config.py in place."""
     text = CONFIG_PATH.read_text(encoding="utf-8")
 
-    # Match the dict literal inside RISK_THRESHOLDS — replace only the values.
+    # Match the dict literal inside RISK_THRESHOLDS - replace only the values.
     pattern = re.compile(
         r'(RISK_THRESHOLDS\s*:\s*dict\s*=\s*\{[^}]*"low_max"\s*:\s*)'
         r'[\d.]+([^}]*"medium_max"\s*:\s*)[\d.]+',
         re.DOTALL,
     )
-    new_text = pattern.sub(
+    new_text, n_subs = pattern.subn(
         lambda m: f"{m.group(1)}{new_low_max}{m.group(2)}{new_medium_max}",
         text,
     )
 
-    if new_text == text:
+    # Count matches rather than comparing text: writing the values already in
+    # config.py is a valid no-op, not a failed match.
+    if n_subs == 0:
         print(
-            "\n  WARNING: Pattern match failed — config.py was not modified.\n"
+            "\n  WARNING: Pattern match failed - config.py was not modified.\n"
             "  Edit RISK_THRESHOLDS manually:\n"
             f"    low_max:    {new_low_max}\n"
             f"    medium_max: {new_medium_max}\n"
@@ -293,23 +300,24 @@ def main() -> None:
         "--split",
         default="dev",
         choices=["dev", "eval"],
-        help="Which cached split to score (default: dev — the calibration split).",
+        help="Which cached split to score (default: dev - the calibration split).",
     )
     parser.add_argument(
         "--weight-a",
         type=float,
-        default=0.5,
+        default=config.PRODUCTION_ENSEMBLE_WEIGHT_A,
         metavar="W",
-        help="Weight for the wav2vec2 classifier in the ensemble (default: 0.5).",
+        help="Weight for the wav2vec2 classifier in the ensemble "
+             "(default: config.PRODUCTION_ENSEMBLE_WEIGHT_A).",
     )
     args = parser.parse_args()
 
     print("=" * 72)
-    print("VoxGuard — RISK_THRESHOLDS calibration")
+    print("VoxGuard - RISK_THRESHOLDS calibration")
     print("=" * 72)
     print(f"\nDetector  : WeightedAverageDetector")
-    print(f"  Backbone A : facebook/wav2vec2-base  → wav2vec2_hindi_combined_logreg")
-    print(f"  Backbone B : microsoft/wavlm-base-plus → wavlm_hindi_combined_logreg")
+    print(f"  Backbone A : facebook/wav2vec2-base    -> {config.PRODUCTION_WHOLECLIP_CLASSIFIERS['wav2vec2']}")
+    print(f"  Backbone B : microsoft/wavlm-base-plus -> {config.PRODUCTION_WHOLECLIP_CLASSIFIERS['wavlm']}")
     print(f"  weight_a={args.weight_a}")
     print(f"\nSplit     : {args.split} (ASVspoof2019)")
     print()
@@ -317,7 +325,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1. Load scores
     # ------------------------------------------------------------------
-    print("Loading embeddings and scoring …")
+    print("Loading embeddings and scoring ...")
     scores, y_true = load_ensemble_scores(args.split, args.weight_a)
 
     # ------------------------------------------------------------------
@@ -332,7 +340,7 @@ def main() -> None:
     # 3. Build and print table
     # ------------------------------------------------------------------
     df = build_table(scores, y_true, current_low, current_medium)
-    print("Candidate threshold pairs — WeightedAverageDetector on ASVspoof2019 "
+    print("Candidate threshold pairs - WeightedAverageDetector on ASVspoof2019 "
           f"{args.split} split\n")
     print_table(df)
     explain_columns()
@@ -359,13 +367,18 @@ def main() -> None:
     )
 
     if abs(rec_low - current_low) < 1e-9 and abs(rec_medium - current_medium) < 1e-9:
-        print("\n  The recommended pair matches the current config — no change needed.")
+        print("\n  The recommended pair matches the current config - no change needed.")
     print()
 
     # ------------------------------------------------------------------
     # 5. Interactive confirmation
     # ------------------------------------------------------------------
     print("-" * 72)
+    if args.split != "dev":
+        print(f"  --split {args.split}: thresholds are calibrated on the dev split only "
+              "(eval is the reporting split; calibrating on it is leakage).")
+        print("  Table shown for inspection - config.py NOT modified.")
+        return
     print("Enter the threshold values to write to config.py, or press Enter to")
     print("accept the recommendation, or type 'q' to quit without changes.\n")
 
@@ -376,7 +389,7 @@ def main() -> None:
         ).strip()
 
         if raw.lower() in ("q", "quit", "exit"):
-            print("\n  Aborted — config.py unchanged.")
+            print("\n  Aborted - config.py unchanged.")
             sys.exit(0)
 
         if raw == "":
@@ -405,7 +418,7 @@ def main() -> None:
             patch_config(new_low, new_medium)
             break
         else:
-            print("  Not confirmed — try again or type 'q' to quit.\n")
+            print("  Not confirmed - try again or type 'q' to quit.\n")
 
 
 if __name__ == "__main__":

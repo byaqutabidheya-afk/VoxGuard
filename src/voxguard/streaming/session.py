@@ -14,8 +14,25 @@ from voxguard.streaming.ema import RunningRiskScore
 from voxguard.streaming.scorer import StreamingScorer
 
 
+CONSECUTIVE_UNITS = ("pushes", "updates")
+
+
 class StreamingSession:
-    """Composes buffering, chunk scoring, and running risk tracking."""
+    """Composes buffering, chunk scoring, and running risk tracking.
+
+    ``consecutive_flags_required`` counts consecutive *decisions* at or above
+    ``flag_threshold``. What one decision is depends on ``consecutive_unit``:
+
+    - ``"pushes"`` (default, the original behaviour): one ``push_audio`` call.
+      The running score only changes when a window completes (every stride,
+      1.0 s with the default 1.5 s window / 0.5 s overlap) but pushes arrive
+      more often (0.25 s in ``simulate_stream``), so with 0.25 s pushes a count
+      of 1..4 all resolve inside a single score update and test no persistence.
+    - ``"updates"``: one score UPDATE, i.e. one scored window. The running
+      score is compared to the threshold each time a window is scored; a window
+      skipped as silence makes no decision and leaves the count unchanged.
+      A count of N then means N consecutive per-stride decisions.
+    """
 
     def __init__(
         self,
@@ -26,7 +43,13 @@ class StreamingSession:
         alpha: float = 0.3,
         flag_threshold: float | None = None,
         consecutive_flags_required: int = 3,
+        consecutive_unit: str = "pushes",
     ) -> None:
+        if consecutive_unit not in CONSECUTIVE_UNITS:
+            raise ValueError(
+                f"consecutive_unit must be one of {CONSECUTIVE_UNITS}; got {consecutive_unit!r}."
+            )
+        self.consecutive_unit = consecutive_unit
         self.detector = detector or WeightedAverageDetector(
             wav2vec2_classifier_path="models/classifiers/wav2vec2_hindi_combined_logreg.joblib",
             wavlm_classifier_path="models/classifiers/wavlm_hindi_combined_logreg.joblib",
@@ -88,17 +111,14 @@ class StreamingSession:
         for window in windows:
             score = self.scorer.score_chunk(window, sr)
             self.risk_score.update(score)
+            if score is not None and self.consecutive_unit == "updates":
+                self._register_decision(float(self.risk_score.current()))
 
         current_score = self.risk_score.current()
         running_score = 0.0 if current_score is None else float(current_score)
 
-        if current_score is not None and running_score >= self.flag_threshold:
-            self._consecutive_flags += 1
-            if self._consecutive_flags >= self.consecutive_flags_required:
-                if self._seconds_to_flag is None:
-                    self._seconds_to_flag = self._audio_seconds_elapsed
-        else:
-            self._consecutive_flags = 0
+        if self.consecutive_unit == "pushes":
+            self._register_decision(None if current_score is None else running_score)
 
         flagged = self._consecutive_flags >= self.consecutive_flags_required
 
@@ -108,6 +128,16 @@ class StreamingSession:
             "seconds_since_start": self._audio_seconds_elapsed,
             "seconds_to_flag": self._seconds_to_flag,
         }
+
+    def _register_decision(self, running_score: float | None) -> None:
+        """Counts one decision: extends the streak if at/above threshold, else resets it."""
+        if running_score is not None and running_score >= self.flag_threshold:
+            self._consecutive_flags += 1
+            if self._consecutive_flags >= self.consecutive_flags_required:
+                if self._seconds_to_flag is None:
+                    self._seconds_to_flag = self._audio_seconds_elapsed
+        else:
+            self._consecutive_flags = 0
 
     def reset(self) -> None:
         """Reset buffering, smoothing, and timing state for a fresh session."""

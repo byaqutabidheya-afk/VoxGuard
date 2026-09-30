@@ -15,7 +15,13 @@ from app.app import (
     process_audio_chunk,
     reset_streaming_session,
 )
+from voxguard import config
 from voxguard.streaming.session import StreamingSession
+
+# Mocked probabilities derived from the LIVE config thresholds (never hardcoded), so recalibrating
+# RISK_THRESHOLDS cannot silently move them into the wrong band.
+_LOW_SCORE = float(config.RISK_THRESHOLDS["low_max"]) / 2.0                      # well inside "low"
+_HIGH_SCORE = (float(config.RISK_THRESHOLDS["medium_max"]) + 1.0) / 2.0          # well inside "high"
 
 
 @patch("app.app.get_detector")
@@ -27,7 +33,7 @@ def test_build_app_structure(mock_get_det: MagicMock) -> None:
 
 def test_process_audio_chunk_none_and_empty() -> None:
     mock_session = MagicMock()
-    mock_session.risk_score.current.return_value = 0.42
+    mock_session.risk_score.current.return_value = _LOW_SCORE
     mock_session._consecutive_flags = 1
     mock_session.consecutive_flags_required = 3
     mock_session._seconds_to_flag = None
@@ -68,7 +74,7 @@ def test_process_audio_chunk_real_and_fusion(mock_get_trans: MagicMock) -> None:
     mock_session.buffer.chunk_samples = 24000
     mock_session.buffer.stride_samples = 16000
     mock_session.push_audio.return_value = {
-        "running_score": 0.8523,
+        "running_score": _HIGH_SCORE,
         "flagged": True,
         "seconds_since_start": 2.5,
         "seconds_to_flag": 2.0,

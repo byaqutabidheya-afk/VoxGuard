@@ -153,3 +153,77 @@ def test_streaming_session_sample_rate_mismatch_error() -> None:
         session.push_audio(frame_48k, 48000)
 
 
+
+
+def _push_quarter_seconds(session: StreamingSession, seconds: float, amplitude: float = 1.0) -> list[dict]:
+    """Pushes `seconds` of audio in 0.25 s steps (the simulate_stream cadence)."""
+    step = np.full(4000, amplitude, dtype=np.float32)
+    return [session.push_audio(step, 16000) for _ in range(int(seconds / 0.25))]
+
+
+def test_consecutive_unit_rejects_unknown_value() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        StreamingSession(detector=_SequencedDetector([0.5]), consecutive_unit="frames")
+
+
+def test_consecutive_unit_updates_counts_score_updates_not_pushes() -> None:
+    """With 1.5 s windows / 0.5 s overlap and 0.25 s pushes the score updates every 4th push.
+
+    Legacy 'pushes' counting with N=2 flags on the second push after the first update (both pushes
+    see the same score); 'updates' counting with N=2 must wait for a SECOND window.
+    """
+    kwargs = dict(chunk_seconds=1.5, overlap_seconds=0.5, alpha=1.0, flag_threshold=0.6, consecutive_flags_required=2)
+
+    legacy = StreamingSession(detector=_SequencedDetector([0.9, 0.9, 0.9]), **kwargs)
+    legacy_results = _push_quarter_seconds(legacy, 3.0)
+    assert legacy_results[5]["seconds_to_flag"] is None          # push 6 (1.5 s): first update, count 1
+    assert legacy_results[6]["seconds_to_flag"] == 1.75          # push 7: same score, count 2 -> flags
+
+    updates = StreamingSession(detector=_SequencedDetector([0.9, 0.9, 0.9]), consecutive_unit="updates", **kwargs)
+    results = _push_quarter_seconds(updates, 3.0)
+    assert all(r["seconds_to_flag"] is None for r in results[:9])  # nothing before the second window (2.5 s)
+    assert results[9]["seconds_to_flag"] == 2.5                    # push 10: second update -> flags
+    assert results[9]["flagged"] is True
+
+
+def test_consecutive_unit_updates_debounces_a_single_spike() -> None:
+    """A lone high window must not flag with N=2 and must reset the streak when the score drops."""
+    session = StreamingSession(
+        detector=_SequencedDetector([0.9, 0.1, 0.9, 0.9]),
+        chunk_seconds=1.5, overlap_seconds=0.5, alpha=1.0, flag_threshold=0.6,
+        consecutive_flags_required=2, consecutive_unit="updates",
+    )
+    results = _push_quarter_seconds(session, 4.5)
+    # windows complete at 1.5, 2.5, 3.5, 4.5 s -> scores 0.9, 0.1, 0.9, 0.9
+    assert session._seconds_to_flag == 4.5
+    assert results[5]["flagged"] is False    # 1.5 s: streak 1
+    assert results[9]["flagged"] is False    # 2.5 s: dropped, streak reset
+    assert results[13]["flagged"] is False   # 3.5 s: streak 1
+    assert results[17]["flagged"] is True    # 4.5 s: streak 2
+
+
+def test_consecutive_unit_updates_ignores_silent_windows() -> None:
+    """A window skipped as silence makes no decision: it neither extends nor resets the streak."""
+    session = StreamingSession(
+        detector=_SequencedDetector([0.9, 0.9]),
+        chunk_seconds=1.0, overlap_seconds=0.0, alpha=1.0, flag_threshold=0.6,
+        consecutive_flags_required=2, consecutive_unit="updates",
+    )
+    loud = np.full(4000, 1.0, dtype=np.float32)
+    quiet = np.zeros(4000, dtype=np.float32)
+
+    for _ in range(4):                       # 0-1 s loud: window 1 scored 0.9 -> streak 1
+        session.push_audio(loud, 16000)
+    assert session._consecutive_flags == 1
+
+    for _ in range(8):                       # 1-3 s silent: windows 2 and 3 skipped, no decision
+        result = session.push_audio(quiet, 16000)
+    assert session._consecutive_flags == 1   # not reset, not extended
+    assert result["flagged"] is False
+
+    for _ in range(4):                       # 3-4 s loud: window 4 scored 0.9 -> streak 2 -> flags
+        result = session.push_audio(loud, 16000)
+    assert result["flagged"] is True
+    assert session._seconds_to_flag == 4.0

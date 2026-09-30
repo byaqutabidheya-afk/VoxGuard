@@ -19,7 +19,13 @@ import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 
+from voxguard import config
 from api.main import MAX_FILE_SIZE_BYTES, app
+
+# Mocked probabilities derived from the LIVE config thresholds (never hardcoded), so recalibrating
+# RISK_THRESHOLDS cannot silently move them into the wrong band.
+_LOW_SCORE = float(config.RISK_THRESHOLDS["low_max"]) / 2.0                      # well inside "low"
+_HIGH_SCORE = (float(config.RISK_THRESHOLDS["medium_max"]) + 1.0) / 2.0          # well inside "high"
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +70,7 @@ def test_analyze_endpoint_mocked(client: TestClient, sample_wav_bytes: bytes) ->
         mock_detector = MagicMock()
         mock_detector.predict_waveform.return_value = {
             "label": "real",
-            "probability_synthetic": 0.08,
+            "probability_synthetic": _LOW_SCORE,
         }
         mock_get_det.return_value = mock_detector
 
@@ -75,7 +81,7 @@ def test_analyze_endpoint_mocked(client: TestClient, sample_wav_bytes: bytes) ->
         assert response.status_code == 200
         data = response.json()
         assert data["label"] == "real"
-        assert data["probability_synthetic"] == pytest.approx(0.08, abs=1e-4)
+        assert data["probability_synthetic"] == pytest.approx(_LOW_SCORE, abs=1e-4)
         assert data["risk_band"] == "low"
         assert data["prevention_message"] is None
 
@@ -87,7 +93,7 @@ def test_analyze_endpoint_high_risk_prevention_message(
         mock_detector = MagicMock()
         mock_detector.predict_waveform.return_value = {
             "label": "synthetic",
-            "probability_synthetic": 0.92,
+            "probability_synthetic": _HIGH_SCORE,
         }
         mock_get_det.return_value = mock_detector
 
@@ -98,7 +104,7 @@ def test_analyze_endpoint_high_risk_prevention_message(
         assert response.status_code == 200
         data = response.json()
         assert data["label"] == "synthetic"
-        assert data["probability_synthetic"] == pytest.approx(0.92, abs=1e-4)
+        assert data["probability_synthetic"] == pytest.approx(_HIGH_SCORE, abs=1e-4)
         assert data["risk_band"] == "high"
         assert data["prevention_message"] is not None
         assert "High-confidence alert" in data["prevention_message"]
@@ -241,7 +247,7 @@ def test_analyze_context_without_enrolled_speaker(
         mock_det = MagicMock()
         mock_det.predict_waveform.return_value = {
             "label": "real",
-            "probability_synthetic": 0.05,
+            "probability_synthetic": _LOW_SCORE,
         }
         mock_detector_getter.return_value = mock_det
 
@@ -252,8 +258,10 @@ def test_analyze_context_without_enrolled_speaker(
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["base_fused_score"] == pytest.approx(0.035, abs=0.01)
-        assert data["contextual_score"] == pytest.approx(0.035, abs=0.01)
+        # No red-flag keywords, general context: fused score is just the audio share of the probability.
+        expected_fused = config.FUSION_AUDIO_WEIGHT * _LOW_SCORE
+        assert data["base_fused_score"] == pytest.approx(expected_fused, abs=0.01)
+        assert data["contextual_score"] == pytest.approx(expected_fused, abs=0.01)
         assert data["risk_band"] == "low"
         assert data["transcript"] == "hello how are you today"
         assert data["matched_redflag_categories"] == []

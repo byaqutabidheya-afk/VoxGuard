@@ -254,7 +254,7 @@ def test_stereo_samples_first_accepted() -> None:
 
 def test_waveform_shorter_than_one_window_returns_empty() -> None:
     """A waveform shorter than window_seconds should return empty arrays."""
-    tiny = _sine(duration=0.1)   # 0.1 s < default window 0.5 s
+    tiny = _sine(duration=0.1)   # 0.1 s < any default window (config.STREAM_CHUNK_SECONDS)
     scores, times = windowed_attribution(tiny, SR, _ConstDetector())
     assert len(scores) == 0
     assert len(times) == 0
@@ -329,3 +329,120 @@ def test_3d_waveform_raises_value_error() -> None:
         windowed_attribution(
             np.zeros((2, 3, 4), dtype=np.float32), SR, _ConstDetector()
         )
+
+
+# ---------------------------------------------------------------------------
+# Config-driven defaults (Phase F4.3)
+# ---------------------------------------------------------------------------
+
+
+def test_default_window_is_config_stream_chunk_seconds(monkeypatch) -> None:
+    """With no window_seconds the window is exactly config.STREAM_CHUNK_SECONDS, read at call time."""
+    from voxguard import config
+
+    monkeypatch.setattr(config, "STREAM_CHUNK_SECONDS", 1.0)
+    wav = _sine(duration=3.0)
+    scores, times = windowed_attribution(wav, SR, _ConstDetector(), stride_seconds=0.5)
+    # window 1.0 s, stride 0.5 s over 3.0 s -> starts 0, 0.5, 1.0, 1.5, 2.0
+    assert len(scores) == 5
+    assert float(times[-1]) == pytest.approx(2.0)
+
+
+def test_default_stride_is_decoupled_from_window(monkeypatch) -> None:
+    from voxguard import config
+    from voxguard.explain.attribution import DEFAULT_STRIDE_SECONDS
+
+    assert DEFAULT_STRIDE_SECONDS == 0.75
+    monkeypatch.setattr(config, "STREAM_CHUNK_SECONDS", 1.5)
+    _, times = windowed_attribution(_sine(duration=4.0), SR, _ConstDetector())
+    assert np.allclose(np.diff(times), 0.75, atol=1 / SR)
+
+
+def test_window_default_none_config_none_raises(monkeypatch) -> None:
+    from voxguard import config
+
+    monkeypatch.setattr(config, "STREAM_CHUNK_SECONDS", None)
+    with pytest.raises(ValueError, match="STREAM_CHUNK_SECONDS"):
+        windowed_attribution(_sine(), SR, _ConstDetector())
+
+
+def test_detector_none_uses_chunked_default_detector(monkeypatch) -> None:
+    import voxguard.explain.attribution as attribution
+
+    stub = _ConstDetector(0.3)
+    monkeypatch.setattr(attribution, "get_default_detector", lambda: stub)
+    scores, _ = windowed_attribution(_sine(duration=3.0), SR)
+    assert stub.call_count == len(scores) > 0
+    assert np.allclose(scores, 0.3)
+
+
+def test_default_detector_is_built_from_production_streaming_config(monkeypatch) -> None:
+    """get_default_detector wires the paths and weight from config, not from hardcoded literals."""
+    import voxguard.classifier.ensemble as ensemble
+    import voxguard.explain.attribution as attribution
+    from voxguard import config
+
+    captured = {}
+
+    class _FakeDetector:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(ensemble, "WeightedAverageDetector", _FakeDetector)
+    attribution.get_default_detector.cache_clear()
+    try:
+        attribution.get_default_detector()
+    finally:
+        attribution.get_default_detector.cache_clear()
+    assert captured["wav2vec2_classifier_path"] == config.BASE_DIR / config.PRODUCTION_STREAMING_CLASSIFIERS["wav2vec2"]
+    assert captured["wavlm_classifier_path"] == config.BASE_DIR / config.PRODUCTION_STREAMING_CLASSIFIERS["wavlm"]
+    assert captured["weight_a"] == config.PRODUCTION_ENSEMBLE_WEIGHT_A
+
+
+class _Capture:
+    """Attaches a handler straight to the module logger (the project logger does not propagate to caplog)."""
+
+    def __init__(self) -> None:
+        import logging
+
+        import voxguard.explain.attribution as attribution
+
+        self.messages: list[str] = []
+        outer = self
+
+        class _H(logging.Handler):
+            def emit(self, record) -> None:
+                outer.messages.append(record.getMessage())
+
+        self._logger, self._handler = attribution.logger, _H(level=logging.WARNING)
+
+    def __enter__(self):
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._logger.removeHandler(self._handler)
+
+
+def test_window_mismatch_with_default_detector_warns(monkeypatch) -> None:
+    """A window other than the training window, with the chunked default detector, is flagged."""
+    import voxguard.explain.attribution as attribution
+    from voxguard import config
+
+    monkeypatch.setattr(attribution, "get_default_detector", lambda: _ConstDetector())
+    monkeypatch.setattr(config, "STREAM_CHUNK_SECONDS", 1.5)
+    with _Capture() as cap:
+        windowed_attribution(_sine(duration=3.0), SR, window_seconds=0.5, stride_seconds=0.5)
+    assert any("training distribution" in m for m in cap.messages)
+
+
+def test_no_window_warning_when_window_matches_or_detector_is_explicit(monkeypatch) -> None:
+    import voxguard.explain.attribution as attribution
+    from voxguard import config
+
+    monkeypatch.setattr(attribution, "get_default_detector", lambda: _ConstDetector())
+    monkeypatch.setattr(config, "STREAM_CHUNK_SECONDS", 1.5)
+    with _Capture() as cap:
+        windowed_attribution(_sine(duration=3.0), SR)                                                   # matches
+        windowed_attribution(_sine(duration=3.0), SR, _ConstDetector(), window_seconds=0.5, stride_seconds=0.5)  # explicit detector
+    assert not any("training distribution" in m for m in cap.messages)

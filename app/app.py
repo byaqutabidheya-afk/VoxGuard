@@ -20,12 +20,14 @@ from typing import Any
 import gradio as gr
 import numpy as np
 
+from voxguard import config
 from voxguard.classifier.ensemble import WeightedAverageDetector
 from voxguard.explain import (
     describe_attribution,
     render_explainability_overlay,
     windowed_attribution,
 )
+from voxguard.explain.attribution import DEFAULT_STRIDE_SECONDS
 from voxguard.features.prosody import ProsodyFeatureExtractor
 from voxguard.fusion.fuse import fuse_risk_with_context
 from voxguard.fusion.redflags import scan_for_redflags
@@ -1438,16 +1440,25 @@ def analyze_uploaded_file(
 # Explainability overlay callback
 # ---------------------------------------------------------------------------
 
+# Window size and stride come from config / the attribution module, never restated as literals: the
+# window must equal config.STREAM_CHUNK_SECONDS (what the chunk-native heads were trained on).
+# The verification figures below are from scripts/fix_verify_overlay.py (models/reports/
+# fix_overlay_separation.md); re-run it and update them if the detector, window or clips change.
 _OVERLAY_CAPTION = (
-    "**Explainability overlay** — coarse, chunk-level attribution using "
-    "1.5 s windows (stride 0.75 s, 50 % overlap). Each column of the heatmap "
+    "**Explainability overlay** — coarse, window-level attribution from the chunk-native "
+    f"detector, scored on {config.STREAM_CHUNK_SECONDS:g} s windows (the window size it was trained "
+    f"on), stepping {DEFAULT_STRIDE_SECONDS:g} s. Each column of the heatmap "
     "shows the detector's synthetic-likelihood score for that time region; "
     "the spectrogram beneath shows the acoustic content. "
     "**Reliability note:** individual time-points may not align with fine "
     "acoustic detail — this is most reliable at clip granularity. "
-    "Verified directionally correct on the soumya_neutral_01 real/synthetic "
-    "pair; results on arbitrary clips are not guaranteed. "
-    "See `data/metadata/PHASE5_STREAMING_NOTES.md` § Phase 10 for full details."
+    "Checked on 5 real/synthetic demo pairs (duration-matched audio): in all 5 the real clip's "
+    "mean score was below its synthetic clone's, and every real clip's mean was below every "
+    "synthetic clip's. **Only 1 of those 5 pairs (soumya) is a held-out speaker;** the other 4 "
+    "are speakers the detector was trained on. On all 25 real + 25 synthetic clips from the "
+    "held-out speaker the ordering also holds, but narrowly (highest real clip mean 0.55, lowest "
+    "synthetic 0.65), so results on arbitrary clips are not guaranteed. "
+    "See `models/reports/fix_overlay_separation.md` for full details."
 )
 
 _OVERLAY_OUTPUT_DIR = Path("data") / "processed" / "overlays"
@@ -1489,25 +1500,22 @@ def generate_overlay(audio_path: str | None) -> tuple[str | None, str, str]:
 
     out_name = Path(audio_path).stem + "_overlay.png"
     out_path = (_OVERLAY_OUTPUT_DIR / out_name).resolve()
+    # Used ONLY for the clip-level label in the explanation card (the whole-clip verdict).
     detector = get_detector()
 
     try:
         saved = render_explainability_overlay(
             waveform=waveform,
             sr=sr,
-            detector=detector,
             output_path=out_path,
-            # window_seconds and stride_seconds deliberately not overridden —
-            # render_explainability_overlay defaults are 1.5 s / 0.75 s,
-            # the empirically verified values from PHASE5_STREAMING_NOTES.md.
+            # detector, window_seconds and stride_seconds deliberately not passed: the defaults are
+            # the chunk-native heads in config.PRODUCTION_STREAMING_CLASSIFIERS and a window of
+            # exactly config.STREAM_CHUNK_SECONDS (what those heads were trained on).
         )
         logger.debug("generate_overlay: saved overlay to %s", saved)
 
-        scores, timestamps = windowed_attribution(
-            waveform=waveform,
-            sr=sr,
-            detector=detector,
-        )
+        # Same defaults as the overlay above, so the explanation card describes the scores that were drawn.
+        scores, timestamps = windowed_attribution(waveform=waveform, sr=sr)
         pred = detector.predict_waveform(waveform, sr)
         label = str(pred.get("label", "real"))
         desc = describe_attribution(scores=scores, timestamps=timestamps, label=label)
